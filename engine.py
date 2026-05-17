@@ -79,6 +79,11 @@ class FridayEngine:
         # Start voice loop thread
         t = threading.Thread(target=self._voice_loop, name="FridayEngine", daemon=True)
         t.start()
+
+        # Start reminder polling thread
+        r = threading.Thread(target=self._reminder_poll_loop, name="ReminderPoller", daemon=True)
+        r.start()
+
         logger.info("FridayEngine started")
 
     def stop(self):
@@ -241,3 +246,77 @@ class FridayEngine:
             self._overlay.set_text(text)
         except Exception:
             pass
+
+    # ── Proactive speaking ─────────────────────────────────────────────────
+
+    def _speak_proactive(self, text: str) -> None:
+        """Speak a message outside of the normal voice cycle (e.g. reminder alerts)."""
+        try:
+            self._set_state("speaking")
+            self._set_text(text[:120])
+            if self._synthesize:
+                audio = self._synthesize(text)
+                self._speaker.speak(audio)
+        except Exception as exc:
+            logger.error("Proactive speech error: %s", exc)
+        finally:
+            import time
+            time.sleep(0.5)
+            self._set_state("idle")
+            self._set_text("F.R.I.D.A.Y. ready")
+
+    # ── Reminder polling ───────────────────────────────────────────────────
+
+    def _reminder_poll_loop(self) -> None:
+        """
+        Background daemon: every 30 seconds check for reminders whose due_time
+        has passed and speak them to the user.
+        """
+        import time
+        import datetime
+        # Stagger start so it doesn't fire immediately on launch
+        time.sleep(10)
+        while not self._stop_event.is_set():
+            try:
+                self._fire_due_reminders()
+            except Exception as exc:
+                logger.error("Reminder poll error: %s", exc)
+            # Sleep in 1-second increments so stop_event is checked promptly
+            for _ in range(30):
+                if self._stop_event.is_set():
+                    return
+                time.sleep(1)
+
+    def _fire_due_reminders(self) -> None:
+        """Check the DB and fire any reminders whose due_time has passed."""
+        import datetime
+        from storage.db import get_conn
+        now = datetime.datetime.now()
+        try:
+            with get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT id, text FROM reminders "
+                    "WHERE done=0 AND due_time IS NOT NULL AND due_time != ''",
+                ).fetchall()
+        except Exception as exc:
+            logger.error("Reminder DB read error: %s", exc)
+            return
+
+        for row in rows:
+            try:
+                due = datetime.datetime.fromisoformat(row["due_time"])
+            except (ValueError, TypeError):
+                continue  # unparseable timestamp — skip
+
+            if due <= now:
+                # Mark done immediately so it never fires twice
+                try:
+                    with get_conn() as conn:
+                        conn.execute("UPDATE reminders SET done=1 WHERE id=?", (row["id"],))
+                        conn.commit()
+                except Exception as exc:
+                    logger.error("Reminder mark-done error: %s", exc)
+                    continue
+
+                logger.info("Reminder fired: %s", row["text"])
+                self._speak_proactive(f"Sir, just a reminder: {row['text']}")

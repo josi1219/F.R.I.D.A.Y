@@ -33,7 +33,9 @@ DB_PATH     = os.path.join(_BASE, "friday.db")
 MAX_HISTORY = 30
 
 # ── Voice ────────────────────────────────────────────────────────────────────
-WHISPER_MODEL   = os.getenv("WHISPER_MODEL",   "base.en")
+# tiny.en is ~4x faster than base.en on CPU — sufficient for voice commands
+WHISPER_MODEL   = os.getenv("WHISPER_MODEL",   "tiny.en")
+WHISPER_DEVICE  = "cpu"   # Intel UHD integrated — CPU-only path
 WAKE_WORD_MODEL = os.getenv("WAKE_WORD_MODEL", "hey_jarvis")
 HOTKEY_ACTIVATE = os.getenv("HOTKEY_ACTIVATE", "ctrl+alt+f")
 

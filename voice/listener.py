@@ -55,7 +55,7 @@ CHUNK_FRAMES  = 1024      # frames per sounddevice callback
 VAD_THRESHOLD     = 0.015  # RMS energy level to detect speech start
 SILENCE_THRESHOLD = 0.008  # RMS level considered silence
 SPEECH_PAD_SECS   = 0.4    # seconds of audio to include before detected speech
-SILENCE_SECS      = 1.2    # consecutive silence seconds to stop recording
+SILENCE_SECS      = 0.7    # consecutive silence seconds to stop recording
 MIN_SPEECH_SECS   = 0.3    # minimum speech duration to bother transcribing
 MAX_SPEECH_SECS   = 30.0   # cap recording at 30 seconds
 
@@ -85,15 +85,17 @@ class VoiceListener:
     # ── Setup ──────────────────────────────────────────────────────────────
 
     def _load_whisper(self):
-        model_name = getattr(config, "WHISPER_MODEL", "base.en")
-        logger.info("Loading faster-whisper model '%s' (first run downloads ~74 MB)...", model_name)
+        model_name   = getattr(config, "WHISPER_MODEL",  "tiny.en")
+        device       = getattr(config, "WHISPER_DEVICE", "cpu")
+        compute_type = "int8"  # best quantisation for CPU
+        logger.info("Loading faster-whisper '%s' on %s...", model_name, device)
         try:
             self._whisper = WhisperModel(
                 model_name,
-                device="cpu",
-                compute_type="int8",
+                device=device,
+                compute_type=compute_type,
             )
-            logger.info("faster-whisper ready")
+            logger.info("faster-whisper ready (%s / %s)", model_name, device)
         except Exception as exc:
             logger.error("Failed to load Whisper model: %s", exc)
             self._whisper = None
@@ -289,9 +291,9 @@ class VoiceListener:
             segments, info = self._whisper.transcribe(
                 audio,
                 language="en",
-                beam_size=3,
+                beam_size=1,          # greedy decode — ~2x faster, negligible quality loss
                 vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 300},
+                vad_parameters={"min_silence_duration_ms": 200},
             )
             text = " ".join(seg.text.strip() for seg in segments)
             return text.strip()

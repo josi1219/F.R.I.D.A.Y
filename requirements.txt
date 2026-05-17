@@ -28,3 +28,13 @@ Pillow>=10.0.0
 PyAutoGUI>=0.9.54
 playwright>=1.44.0
 pywin32>=306
+
+# OS control
+pycaw>=20240210
+pyperclip>=1.8.2
+comtypes>=1.4.0
+
+# Gmail
+google-api-python-client>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0
