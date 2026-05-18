@@ -26,7 +26,7 @@ app.secret_key = config.SECRET_KEY
 
 # ── Bootstrap ───────────────────────────────────────────────────────────
 init_db()
-ai = FridayAI(api_key=config.GEMINI_API_KEY, model_name=config.GEMINI_MODEL)
+ai = FridayAI()
 
 _FALLBACKS = [
     "My Gemini uplink is unavailable right now, Sir. "

@@ -9,14 +9,52 @@ from dotenv import load_dotenv
 _BASE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_BASE, '.env'))
 
-# ── Gemini ──────────────────────────────────────────────────────────────────
+# ── AI Provider ──────────────────────────────────────────────────────────────
+# Switch between "gemini" and "groq" in .env
+AI_PROVIDER   = os.getenv("AI_PROVIDER", "gemini").lower()
+
+# ── Gemini ───────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+# ── Groq ─────────────────────────────────────────────────────────────────────
+GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL        = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# ── STT (Speech-to-Text) ─────────────────────────────────────────────────────
+# Switch between "whisper" (offline), "groq", or "deepgram" in .env
+STT_PROVIDER      = os.getenv("STT_PROVIDER", "whisper").lower()
+
+# Offline Whisper settings
+WHISPER_MODEL     = os.getenv("WHISPER_MODEL", "tiny.en")
+WHISPER_DEVICE    = os.getenv("WHISPER_DEVICE", "cpu")
+
+# Groq Whisper settings (reuses GROQ_API_KEY above)
+GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
+
+# Deepgram settings
+DEEPGRAM_API_KEY  = os.getenv("DEEPGRAM_API_KEY", "")
+DEEPGRAM_MODEL    = os.getenv("DEEPGRAM_MODEL", "nova-3")
 
 # ── Flask ───────────────────────────────────────────────────────────────────
 SECRET_KEY = os.getenv("SECRET_KEY", os.urandom(32).hex())
 
 # ── TTS ─────────────────────────────────────────────────────────────────────
+# en-GB-ThomasNeural — formal RP British male, closer to JARVIS (Paul Bettany)
+# FRIDAY_VOICE = "en-GB-ThomasNeural"
+
+# TTS_MODES = {
+#     "normal":     {"rate": "-4%",   "pitch": "-4Hz"},   # calm, precise, JARVIS baseline
+#     "excited":    {"rate": "+6%",   "pitch": "+0Hz"},   # quicker, still composed
+#     "urgent":     {"rate": "+12%",  "pitch": "+2Hz"},   # brisk, alert
+#     "calm":       {"rate": "-10%",  "pitch": "-8Hz"},   # very measured
+#     "apologetic": {"rate": "-6%",   "pitch": "-6Hz"},   # slow, sincere
+#     "warm":       {"rate": "-2%",   "pitch": "-3Hz"},   # gentle
+# }
+
+
+
+# orginal_friday
 FRIDAY_VOICE = "en-IE-EmilyNeural"
 
 TTS_MODES = {
@@ -28,6 +66,17 @@ TTS_MODES = {
     "warm":       {"rate": "+5%",  "pitch": "-1Hz"},
 }
 
+#jarvis1
+# FRIDAY_VOICE = "en-GB-RyanNeural"
+
+# TTS_MODES = {
+#     "normal":     {"rate": "-5%",   "pitch": "-8Hz"},   # calm, deliberate, JARVIS baseline
+#     "excited":    {"rate": "+5%",   "pitch": "-4Hz"},   # slightly quicker, still composed
+#     "urgent":     {"rate": "+10%",  "pitch": "-2Hz"},   # brisk but controlled
+#     "calm":       {"rate": "-12%",  "pitch": "-12Hz"},  # very measured, deep
+#     "apologetic": {"rate": "-8%",   "pitch": "-10Hz"},  # slow, sincere
+#     "warm":       {"rate": "-4%",   "pitch": "-6Hz"},   # gentle, warm
+# }
 # ── Storage ─────────────────────────────────────────────────────────────────
 DB_PATH     = os.path.join(_BASE, "friday.db")
 MAX_HISTORY = 30

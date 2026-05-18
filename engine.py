@@ -204,26 +204,11 @@ class FridayEngine:
             self._set_state("thinking")
             self._set_text(text)
 
-            # ── THINKING ──────────────────────────────────────────────────
-            response = self._ai.chat(text)
-            if not response:
-                response = (
-                    "My AI uplink is unavailable at the moment, Sir. "
-                    "I can still handle local commands."
-                )
-
-            logger.info("Friday: %s", response)
-
-            # ── SPEAKING ──────────────────────────────────────────────────
-            self._set_state("speaking")
-            self._set_text(response[:120])
-
-            if self._synthesize:
-                try:
-                    audio = self._synthesize(response)
-                    self._speaker.speak(audio)
-                except Exception as exc:
-                    logger.error("TTS error: %s", exc)
+            # ── STREAM THINK + SPEAK ───────────────────────────────────────
+            # Gemini tokens stream in → split into sentences → each sentence
+            # synthesized immediately → played as ready. First audio arrives
+            # ~800ms after speech ends instead of waiting for full response.
+            self._stream_respond(text)
 
         except Exception as exc:
             logger.error("Voice cycle error: %s", exc)
@@ -232,6 +217,87 @@ class FridayEngine:
             self._set_text("F.R.I.D.A.Y. ready")
             with self._active_lock:
                 self._is_active = False
+
+    # ── Streaming respond ───────────────────────────────────────────────────
+
+    def _stream_respond(self, user_text: str) -> None:
+        """
+        Pipeline: stream Gemini tokens → split into sentences → synthesize each
+        sentence immediately → play as ready.
+        First audio plays ~800ms after speech ends (vs 2-4s with blocking path).
+        Falls back to blocking chat() if streaming yields no text (tool calls).
+        """
+        import re
+        import queue as _queue
+
+        SENT_END = re.compile(r'(?<=[.!?])\s+')
+        sentence_q: _queue.Queue = _queue.Queue()
+        audio_q: _queue.Queue = _queue.Queue(maxsize=3)
+        full_parts: list = []
+
+        def _stream_and_split():
+            buf = ""
+            for token in self._ai.chat_stream(user_text):
+                buf += token
+                full_parts.append(token)
+                parts = SENT_END.split(buf)
+                if len(parts) > 1:
+                    for s in parts[:-1]:
+                        if s.strip():
+                            sentence_q.put(s.strip())
+                    buf = parts[-1]
+            if buf.strip():
+                sentence_q.put(buf.strip())
+            sentence_q.put(None)  # sentinel
+
+        def _synthesize_loop():
+            while True:
+                sentence = sentence_q.get()
+                if sentence is None:
+                    audio_q.put(None)
+                    return
+                try:
+                    audio = self._synthesize(sentence)
+                    audio_q.put(audio)
+                except Exception as exc:
+                    logger.error("TTS error: %s", exc)
+
+        t_stream = threading.Thread(target=_stream_and_split, daemon=True)
+        t_synth  = threading.Thread(target=_synthesize_loop, daemon=True)
+        t_stream.start()
+        t_synth.start()
+
+        first = True
+        while True:
+            audio = audio_q.get()
+            if audio is None:
+                break
+            if first:
+                self._set_state("speaking")
+                first = False
+            self._speaker.speak(audio)
+
+        t_stream.join(timeout=30)
+        full_response = "".join(full_parts)
+
+        if full_response.strip():
+            logger.info("Friday: %s", full_response)
+            self._set_text(full_response[:120])
+        else:
+            # Streaming yielded nothing — tool calls were made (AFC handles them
+            # in non-streaming mode). Re-send via blocking chat().
+            logger.info("Stream empty — falling back to blocking chat (tool call path)")
+            response = self._ai.chat(user_text) or \
+                "My AI uplink is unavailable at the moment, Sir."
+            logger.info("Friday: %s", response)
+            self._set_state("speaking")
+            self._set_text(response[:120])
+            if self._synthesize:
+                try:
+                    audio = self._synthesize(response)
+                    self._speaker.speak(audio)
+                except Exception as exc:
+                    logger.error("TTS error: %s", exc)
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -295,7 +361,7 @@ class FridayEngine:
         try:
             with get_conn() as conn:
                 rows = conn.execute(
-                    "SELECT id, text FROM reminders "
+                    "SELECT id, text, due_time FROM reminders "
                     "WHERE done=0 AND due_time IS NOT NULL AND due_time != ''",
                 ).fetchall()
         except Exception as exc:

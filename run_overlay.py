@@ -61,8 +61,8 @@ if __name__ == '__main__':
     # ── Init storage ─────────────────────────────────────────────────────
     init_db()
 
-    # ── Init Gemini AI ───────────────────────────────────────────────────
-    ai = FridayAI(api_key=config.GEMINI_API_KEY, model_name=config.GEMINI_MODEL)
+    # ── Init AI ──────────────────────────────────────────────────────────
+    ai = FridayAI()
 
     # ── Start Flask in background ─────────────────────────────────────────
     flask_thread = threading.Thread(target=_run_flask, name="Flask", daemon=True)

@@ -5,10 +5,12 @@ Continuous microphone input pipeline:
   Optional: OpenWakeWord wake word detection ("hey_jarvis")
 """
 
+import io
 import logging
 import queue
 import threading
 import time
+import wave
 import os
 import sys
 
@@ -34,6 +36,13 @@ try:
 except ImportError:
     HAS_WHISPER = False
     logger.warning("faster-whisper not installed — voice input unavailable")
+
+try:
+    import requests as _requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+    logger.warning("requests not installed — online STT unavailable")
 
 try:
     import openwakeword
@@ -73,12 +82,20 @@ class VoiceListener:
         self._wake_model: "WakeWordModel | None" = None
         self._ready = False
         self._stop_event = threading.Event()
+        self._stt_provider = getattr(config, "STT_PROVIDER", "whisper").lower()
 
-        if not HAS_SOUNDDEVICE or not HAS_WHISPER:
-            logger.error("Voice listener cannot start — missing dependencies")
+        if not HAS_SOUNDDEVICE:
+            logger.error("Voice listener cannot start — sounddevice not installed")
             return
 
-        self._load_whisper()
+        if self._stt_provider == "whisper":
+            if not HAS_WHISPER:
+                logger.error("Voice listener cannot start — faster-whisper not installed")
+                return
+            self._load_whisper()
+        else:
+            logger.info("STT provider: %s (online mode)", self._stt_provider)
+
         self._load_wake_word()
         self._ready = True
 
@@ -119,7 +136,9 @@ class VoiceListener:
 
     @property
     def ready(self) -> bool:
-        return self._ready and self._whisper is not None
+        if self._stt_provider == "whisper":
+            return self._ready and self._whisper is not None
+        return self._ready
 
     def stop(self):
         """Signal any blocking listen call to abort."""
@@ -286,12 +305,20 @@ class VoiceListener:
     # ── Internal ────────────────────────────────────────────────────────────
 
     def _transcribe(self, audio: np.ndarray) -> str:
-        """Run faster-whisper on a float32 numpy array at 16kHz."""
+        """Route transcription to the configured STT provider."""
+        if self._stt_provider == "groq":
+            return self._transcribe_groq(audio)
+        elif self._stt_provider == "deepgram":
+            return self._transcribe_deepgram(audio)
+        return self._transcribe_whisper(audio)
+
+    def _transcribe_whisper(self, audio: np.ndarray) -> str:
+        """Run faster-whisper locally on a float32 numpy array at 16kHz."""
         try:
-            segments, info = self._whisper.transcribe(
+            segments, _info = self._whisper.transcribe(
                 audio,
                 language="en",
-                beam_size=1,          # greedy decode — ~2x faster, negligible quality loss
+                beam_size=5,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 200},
             )
@@ -299,4 +326,68 @@ class VoiceListener:
             return text.strip()
         except Exception as exc:
             logger.error("Whisper transcription error: %s", exc)
+            return ""
+
+    def _to_wav_bytes(self, audio: np.ndarray) -> io.BytesIO:
+        """Convert float32 numpy audio to a WAV BytesIO buffer."""
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes((audio * 32767).astype(np.int16).tobytes())
+        buf.seek(0)
+        return buf
+
+    def _transcribe_groq(self, audio: np.ndarray) -> str:
+        """Send audio to Groq Whisper API and return transcript."""
+        if not HAS_REQUESTS:
+            logger.error("requests not installed — cannot use Groq STT")
+            return ""
+        api_key = getattr(config, "GROQ_API_KEY", "")
+        if not api_key:
+            logger.error("GROQ_API_KEY not set — cannot use Groq STT")
+            return ""
+        model = getattr(config, "GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
+        buf = self._to_wav_bytes(audio)
+        try:
+            resp = _requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                files={"file": ("audio.wav", buf, "audio/wav")},
+                data={"model": model, "language": "en"},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            return resp.json().get("text", "").strip()
+        except Exception as exc:
+            logger.error("Groq STT error: %s", exc)
+            return ""
+
+    def _transcribe_deepgram(self, audio: np.ndarray) -> str:
+        """Send audio to Deepgram Nova API and return transcript."""
+        if not HAS_REQUESTS:
+            logger.error("requests not installed — cannot use Deepgram STT")
+            return ""
+        api_key = getattr(config, "DEEPGRAM_API_KEY", "")
+        if not api_key:
+            logger.error("DEEPGRAM_API_KEY not set — cannot use Deepgram STT")
+            return ""
+        model = getattr(config, "DEEPGRAM_MODEL", "nova-3")
+        buf = self._to_wav_bytes(audio)
+        try:
+            resp = _requests.post(
+                f"https://api.deepgram.com/v1/listen?model={model}&language=en&smart_format=true",
+                headers={
+                    "Authorization": f"Token {api_key}",
+                    "Content-Type": "audio/wav",
+                },
+                data=buf.read(),
+                timeout=20,
+            )
+            resp.raise_for_status()
+            channels = resp.json()["results"]["channels"]
+            return channels[0]["alternatives"][0]["transcript"].strip()
+        except Exception as exc:
+            logger.error("Deepgram STT error: %s", exc)
             return ""
