@@ -49,7 +49,7 @@ def local_fallback(text: str):
 
     if re.search(r'\b(who are you|what are you|introduce yourself|your name|what.s your name)\b', tl):
         return (
-            "I'm F.R.I.D.A.Y. — Female Replacement Intelligent Digital Assistant Youth. "
+            "I'm FRIDAY — Female Replacement Intelligent Digital Assistant Youth. "
             "Your personal AI, Sir. Always at your service."
         )
 
@@ -112,7 +112,7 @@ def chat_stream():
             pass
 
         if not got_any:
-            fallback = ai.chat(user_message) or random.choice(_FALLBACKS)
+            fallback = random.choice(_FALLBACKS)
             yield f"data: {json.dumps({'text': fallback, 'done': False})}\n\n"
 
         yield f"data: {json.dumps({'done': True})}\n\n"

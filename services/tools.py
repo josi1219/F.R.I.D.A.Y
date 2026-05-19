@@ -11,6 +11,7 @@ import re
 import subprocess
 import webbrowser
 import sys
+from urllib.parse import quote_plus as _qp
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -35,6 +36,46 @@ except ImportError:
     HAS_REQUESTS = False
 
 from storage.db import get_conn
+
+
+# ── Gemini vision helpers — shared client + rotation ─────────────────────────
+
+def _get_vision_client():
+    """
+    Return (client, model_name) using the SAME key as the active chat session.
+    Falls back to building a client from config if the engine isn't available.
+    """
+    if _engine is not None and hasattr(_engine, '_ai'):
+        ai = _engine._ai
+        if getattr(ai, '_client', None) is not None:
+            return ai._client, ai._model_name
+    # Fallback when running without the overlay engine (e.g. web-only mode)
+    try:
+        from google import genai as _genai
+        import config as _cfg
+        keys = getattr(_cfg, "GEMINI_API_KEYS", [])
+        if keys:
+            return _genai.Client(api_key=keys[0]), _cfg.GEMINI_MODEL
+    except Exception:
+        pass
+    return None, None
+
+
+def _rotate_vision_key() -> bool:
+    """Tell the AI service to advance to the next API key (shared with chat)."""
+    if _engine is not None and hasattr(_engine, '_ai'):
+        ai = _engine._ai
+        if hasattr(ai, '_rotate_gemini_key'):
+            return ai._rotate_gemini_key()
+    return False
+
+
+def _is_vision_rate_limit(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(x in msg for x in (
+        "429", "quota", "resource_exhausted", "rate limit",
+        "ratelimitexceeded", "too many requests", "quota exceeded",
+    ))
 
 
 # ── Time / Date ──────────────────────────────────────────────────────────────
@@ -246,14 +287,14 @@ def take_screenshot() -> str:
 
 def search_web(query: str) -> str:
     """Search Google for the given query and open results in the browser."""
-    url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+    url = f"https://www.google.com/search?q={_qp(query)}"
     webbrowser.open(url)
     return f"Opened Google search for: {query}"
 
 
 def search_youtube(query: str) -> str:
     """Search YouTube for a video or topic and open results in the browser."""
-    url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
+    url = f"https://www.youtube.com/results?search_query={_qp(query)}"
     webbrowser.open(url)
     return f"Opened YouTube search for: {query}"
 
@@ -272,9 +313,9 @@ def get_directions(destination: str, origin: str = "") -> str:
     destination: where to go (required).
     origin: starting point (optional; omit to use current location).
     """
-    dest = destination.replace(' ', '+')
+    dest = _qp(destination)
     if origin.strip():
-        orig = origin.strip().replace(' ', '+')
+        orig = _qp(origin.strip())
         url  = f"https://www.google.com/maps/dir/{orig}/{dest}"
         desc = f"directions from {origin} to {destination}"
     else:
@@ -286,7 +327,7 @@ def get_directions(destination: str, origin: str = "") -> str:
 
 def search_maps(query: str) -> str:
     """Search Google Maps for a place, business, or address."""
-    url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
+    url = f"https://www.google.com/maps/search/{_qp(query)}"
     webbrowser.open(url)
     return f"Opened Google Maps search for: {query}"
 
@@ -297,7 +338,8 @@ def add_reminder(text: str, due_time: str = "") -> str:
     """
     Add a new reminder to the reminder list.
     text: what to be reminded about.
-    due_time: optional time string such as '3:00 PM' or '2026-05-16 15:00'.
+    due_time: optional ISO datetime string, e.g. '2026-05-18 15:00'. Always use YYYY-MM-DD HH:MM format.
+    Do NOT pass '3:00 PM' style strings — use get_current_date to determine today's date if needed.
     """
     try:
         with get_conn() as conn:
@@ -401,17 +443,30 @@ def capture_and_analyze_screen(question: str = "Describe what you see on the scr
     check an error, analyze a chart, or describe what is currently on display.
     question: what to ask about the screen, e.g. 'What error is shown?'
     """
-    try:
-        from vision.analyzer import ScreenAnalyzer
-        import config as _cfg
-        from google import genai as _genai
-        client = _genai.Client(api_key=_cfg.GEMINI_API_KEY)
-        analyzer = ScreenAnalyzer(client, _cfg.GEMINI_MODEL)
-        result = analyzer.analyze(question)
-        _try_annotate_from_vision(question, result)
-        return result
-    except Exception as exc:
-        return f"Screen analysis error: {exc}"
+    import config as _cfg
+    max_attempts = max(1, len(getattr(_cfg, "GEMINI_API_KEYS", [None])))
+    last_exc = None
+    for _attempt in range(max_attempts):
+        client, model = _get_vision_client()
+        if client is None:
+            return "Gemini Vision not available — no API key configured."
+        try:
+            from vision.analyzer import ScreenAnalyzer
+            analyzer = ScreenAnalyzer(client, model)
+            result = analyzer.analyze(question)
+            _try_annotate_from_vision(question, result)
+            return result
+        except Exception as exc:
+            last_exc = exc
+            if _is_vision_rate_limit(exc):
+                import logging; logging.getLogger(__name__).warning(
+                    "Vision rate limited on attempt %d — rotating key...", _attempt + 1
+                )
+                if not _rotate_vision_key():
+                    break
+                continue
+            return f"Screen analysis error: {exc}"
+    return f"Screen analysis error: {last_exc}"
 
 
 def read_text_on_screen() -> str:
@@ -430,24 +485,37 @@ def find_on_screen(description: str) -> str:
     description: what to look for, e.g. 'the Close button', 'the search bar', 'the error dialog'
     Returns a description of where it is on screen (or that it was not found).
     """
-    try:
-        from vision.analyzer import ScreenAnalyzer
-        import config as _cfg
-        from google import genai as _genai
-        client   = _genai.Client(api_key=_cfg.GEMINI_API_KEY)
-        analyzer = ScreenAnalyzer(client, _cfg.GEMINI_MODEL)
-        info = analyzer.find_element(description)
-        if info.get("found"):
-            x, y, w, h = info["x"], info["y"], info["w"], info["h"]
-            if _ann_overlay:
-                try:
-                    _ann_overlay.highlight_region(x, y, w, h, label=description)
-                except Exception:
-                    pass
-            return f"Found '{description}' at ({x}, {y}), size {w}x{h}"
-        return f"Could not find '{description}' on screen"
-    except Exception as exc:
-        return f"Screen element search error: {exc}"
+    import config as _cfg
+    max_attempts = max(1, len(getattr(_cfg, "GEMINI_API_KEYS", [None])))
+    last_exc = None
+    for _attempt in range(max_attempts):
+        client, model = _get_vision_client()
+        if client is None:
+            return "Gemini Vision not available — no API key configured."
+        try:
+            from vision.analyzer import ScreenAnalyzer
+            analyzer = ScreenAnalyzer(client, model)
+            info = analyzer.find_element(description)
+            if info.get("found"):
+                x, y, w, h = info["x"], info["y"], info["w"], info["h"]
+                if _ann_overlay:
+                    try:
+                        _ann_overlay.highlight_region(x, y, w, h, label=description)
+                    except Exception:
+                        pass
+                return f"Found '{description}' at ({x}, {y}), size {w}x{h}"
+            return f"Could not find '{description}' on screen"
+        except Exception as exc:
+            last_exc = exc
+            if _is_vision_rate_limit(exc):
+                import logging; logging.getLogger(__name__).warning(
+                    "Vision rate limited on attempt %d — rotating key...", _attempt + 1
+                )
+                if not _rotate_vision_key():
+                    break
+                continue
+            return f"Screen element search error: {exc}"
+    return f"Screen element search error: {last_exc}"
 
 
 def _try_annotate_from_vision(question: str, result: str) -> None:
@@ -1208,6 +1276,42 @@ def delete_note(note_id: int) -> str:
         return f"Delete note error: {exc}"
 
 
+# ── Persistent Memory ─────────────────────────────────────────────────────
+
+def remember_fact(fact: str) -> str:
+    """
+    Save an important fact about the user to persistent memory.
+    fact: a concise statement, e.g. 'User prefers Celsius' or 'User\'s name is Alex'.
+    Call this when the user shares personal details, preferences, or asks you to remember
+    something. Facts persist across sessions and are injected at the start of each new chat.
+    Never store passwords, API keys, or other sensitive credentials.
+    """
+    try:
+        with get_conn() as conn:
+            conn.execute("INSERT INTO memories (content) VALUES (?)", (fact,))
+            conn.commit()
+        return f"Remembered: {fact}"
+    except Exception as exc:
+        return f"Memory save error: {exc}"
+
+
+def forget_fact(fact_id: int) -> str:
+    """
+    Remove a persistent memory by its numeric ID.
+    fact_id: the ID shown in the memory list injected at the start of this session.
+    Call this when information is outdated or the user asks you to forget something.
+    """
+    try:
+        with get_conn() as conn:
+            result = conn.execute("DELETE FROM memories WHERE id=?", (fact_id,))
+            conn.commit()
+        if result.rowcount:
+            return f"Memory #{fact_id} forgotten"
+        return f"No memory with ID #{fact_id} found"
+    except Exception as exc:
+        return f"Memory delete error: {exc}"
+
+
 # ── Shell Commands ────────────────────────────────────────────────────────────
 
 def run_shell_command(command: str) -> str:
@@ -1314,6 +1418,9 @@ TOOL_MAP: dict = {fn.__name__: fn for fn in [
     list_notes,
     read_note,
     delete_note,
+    # Memory
+    remember_fact,
+    forget_fact,
     # Shell
     run_shell_command,
 ]}

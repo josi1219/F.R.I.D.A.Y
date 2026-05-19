@@ -60,6 +60,7 @@ class VoiceSpeaker:
         self._stop_flag.clear()
 
         with self._lock:
+            tmp_path = None
             try:
                 # Write to a named temp file — pygame.mixer.music.load needs a file
                 audio.seek(0)
@@ -73,20 +74,22 @@ class VoiceSpeaker:
                 self._playing = True
 
                 # Wait for playback to finish or stop signal
+                clock = pygame.time.Clock()
                 while pygame.mixer.music.get_busy():
                     if self._stop_flag.is_set():
                         pygame.mixer.music.stop()
                         break
-                    pygame.time.Clock().tick(20)
+                    clock.tick(20)
 
             except Exception as exc:
                 logger.error("Playback error: %s", exc)
             finally:
                 self._playing = False
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
 
     def speak_async(self, audio: io.BytesIO) -> threading.Thread:
         """

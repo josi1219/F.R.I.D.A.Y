@@ -60,13 +60,17 @@ CHANNELS      = 1
 DTYPE         = "float32"
 CHUNK_FRAMES  = 1024      # frames per sounddevice callback
 
-# VAD parameters
-VAD_THRESHOLD     = 0.015  # RMS energy level to detect speech start
-SILENCE_THRESHOLD = 0.008  # RMS level considered silence
+# VAD parameters — defaults from config (tunable via .env)
+VAD_THRESHOLD     = getattr(config, "VAD_THRESHOLD",         0.005)  # RMS energy level to detect speech start
+SILENCE_THRESHOLD = getattr(config, "VAD_SILENCE_THRESHOLD", 0.003)  # RMS level considered silence
 SPEECH_PAD_SECS   = 0.4    # seconds of audio to include before detected speech
 SILENCE_SECS      = 0.7    # consecutive silence seconds to stop recording
-MIN_SPEECH_SECS   = 0.3    # minimum speech duration to bother transcribing
-MAX_SPEECH_SECS   = 30.0   # cap recording at 30 seconds
+MIN_SPEECH_SECS   = 0.15   # minimum speech duration to bother transcribing
+MAX_SPEECH_SECS   = 60.0   # cap recording at 60 seconds
+
+# Wake keyword spotter parameters
+WAKE_KEYWORD       = getattr(config, "WAKE_KEYWORD",       "friday").lower()
+WAKE_VAD_THRESHOLD = getattr(config, "WAKE_VAD_THRESHOLD", 0.001)   # ultra-sensitive for wake detection
 
 
 class VoiceListener:
@@ -121,15 +125,39 @@ class VoiceListener:
         if not HAS_WAKE_WORD:
             return
         model_name = getattr(config, "WAKE_WORD_MODEL", "hey_jarvis")
-        try:
-            logger.info("Loading OpenWakeWord model '%s'...", model_name)
-            self._wake_model = WakeWordModel(
+
+        def _try_load():
+            return WakeWordModel(
                 wakeword_models=[model_name],
                 inference_framework="onnx",
             )
+
+        def _download_and_load():
+            """Background thread: download model then swap it in."""
+            try:
+                logger.info("Wake word model not found — downloading '%s' in background...", model_name)
+                import openwakeword as _oww
+                # Download all models (no-arg call) so the shared embedding_model.onnx
+                # is included — downloading only by model name skips it.
+                _oww.utils.download_models()
+                self._wake_model = _try_load()
+                logger.info("Wake word '%s' downloaded and ready", model_name)
+            except Exception as dl_exc:
+                logger.warning("Wake word model download failed (%s) — hotkey only", dl_exc)
+
+        try:
+            logger.info("Loading OpenWakeWord model '%s'...", model_name)
+            self._wake_model = _try_load()
             logger.info("Wake word '%s' ready", model_name)
         except Exception as exc:
-            logger.warning("Wake word model failed to load (%s) — hotkey only", exc)
+            exc_str = str(exc).lower()
+            # Model file missing — kick off a background download so startup isn't blocked
+            if any(x in exc_str for x in ("no_suchfile", "no such file", "file doesn't exist", "doesn't exist")):
+                logger.warning("Wake word model missing — starting background download (hotkey active meanwhile)")
+                t = threading.Thread(target=_download_and_load, daemon=True)
+                t.start()
+            else:
+                logger.warning("Wake word model failed to load (%s) — hotkey only", exc)
             self._wake_model = None
 
     # ── Public API ─────────────────────────────────────────────────────────
@@ -226,12 +254,28 @@ class VoiceListener:
 
     def wait_for_wake_word(self, timeout: float = 0.0) -> bool:
         """
-        Block until the configured wake word is detected.
-        Returns True when wake word is heard, False on timeout/stop.
-        timeout=0 means wait forever.
+        Block until the wake keyword is heard in any phrase.
+        Uses STT-based keyword spotter when WAKE_KEYWORD is set —
+        any phrase containing the keyword triggers wake-up, e.g.:
+          'hey friday', 'chop chop friday', 'yo friday', just 'friday'.
+        Falls back to OpenWakeWord model if no keyword / STT is available.
+        Returns True when detected, False on timeout/stop.
         """
-        if not self.ready or self._wake_model is None:
-            # No wake word model — caller falls back to hotkey
+        if not self.ready:
+            return False
+
+        # Use STT keyword spotter when WAKE_KEYWORD is set and STT is available
+        stt_ok = (
+            (self._whisper is not None)                           # local Whisper loaded
+            or (bool(getattr(config, "GROQ_API_KEY", "")) and HAS_REQUESTS)  # Groq online
+            or bool(getattr(config, "DEEPGRAM_API_KEY", ""))      # Deepgram online
+        )
+        if WAKE_KEYWORD and stt_ok:
+            self._stop_event.clear()
+            return self._wait_for_keyword(timeout)
+
+        # Fallback: OpenWakeWord model
+        if self._wake_model is None:
             return False
 
         self._stop_event.clear()
@@ -271,6 +315,109 @@ class VoiceListener:
                         return True
                 except Exception:
                     pass
+        return False
+
+    def _wait_for_keyword(self, timeout: float = 0.0) -> bool:
+        """
+        Ultra-sensitive STT-based keyword spotter.
+        Continuously records audio bursts above WAKE_VAD_THRESHOLD and checks
+        whether Groq Whisper's transcription contains WAKE_KEYWORD.
+        Any phrase with the keyword wakes FRIDAY regardless of surrounding words.
+        """
+        min_chunks    = int(0.40 * SAMPLE_RATE / CHUNK_FRAMES)   # skip clips < 0.4s  (noise/echo)
+        max_chunks    = int(2.5  * SAMPLE_RATE / CHUNK_FRAMES)   # cap at 2.5s for fast turnaround
+        silence_limit = int(0.4  * SAMPLE_RATE / CHUNK_FRAMES)   # 0.4s silence = end of clip
+        # Minimum average RMS for the full clip — below this it's ambient noise, not real speech
+        MIN_CLIP_RMS  = 0.004
+
+        start   = time.time()
+        chunk_q: queue.Queue = queue.Queue()
+
+        def callback(indata, frames, time_info, status):
+            chunk_q.put(indata.copy())
+
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype=DTYPE,
+            blocksize=CHUNK_FRAMES,
+            callback=callback,
+        )
+
+        with stream:
+            # ── Flush 1 second of stale audio on startup ──────────────────
+            # Prevents re-triggering on residual mic audio from the previous
+            # utterance (e.g. "friday sleep" echoing into the new stream).
+            flush_target = int(1.0 * SAMPLE_RATE / CHUNK_FRAMES)
+            flushed = 0
+            while flushed < flush_target and not self._stop_event.is_set():
+                try:
+                    chunk_q.get(timeout=0.1)
+                    flushed += 1
+                except queue.Empty:
+                    break
+
+            while not self._stop_event.is_set():
+                if timeout > 0 and time.time() - start > timeout:
+                    return False
+
+                # Wait for an energy burst above the ultra-sensitive wake threshold
+                try:
+                    chunk = chunk_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                mono = chunk[:, 0] if chunk.ndim > 1 else chunk
+                rms  = float(np.sqrt(np.mean(mono ** 2)))
+
+                if rms < WAKE_VAD_THRESHOLD:
+                    continue  # silence — keep scanning
+
+                # Energy detected — collect the full burst
+                audio_buf      = [mono]
+                silence_chunks = 0
+
+                while not self._stop_event.is_set() and len(audio_buf) < max_chunks:
+                    try:
+                        chunk = chunk_q.get(timeout=0.1)
+                    except queue.Empty:
+                        break
+                    mono = chunk[:, 0] if chunk.ndim > 1 else chunk
+                    rms  = float(np.sqrt(np.mean(mono ** 2)))
+                    audio_buf.append(mono)
+                    if rms < SILENCE_THRESHOLD:
+                        silence_chunks += 1
+                        if silence_chunks >= silence_limit:
+                            break
+                    else:
+                        silence_chunks = 0
+
+                # Skip clips that are too short — likely noise bursts
+                if len(audio_buf) < min_chunks:
+                    continue
+
+                # Skip clips with insufficient average energy — ambient noise, not speech
+                audio = np.concatenate(audio_buf)
+                if float(np.sqrt(np.mean(audio ** 2))) < MIN_CLIP_RMS:
+                    continue
+
+                # Transcribe with configured STT provider (Whisper / Groq / Deepgram)
+                try:
+                    text = self._transcribe(audio).lower().strip()
+                except Exception:
+                    continue
+
+                if WAKE_KEYWORD in text:
+                    logger.info("Wake keyword %r detected in: %r", WAKE_KEYWORD, text)
+                    return True
+
+                # Not a match — drain stale queue backlog and keep listening
+                while not chunk_q.empty():
+                    try:
+                        chunk_q.get_nowait()
+                    except queue.Empty:
+                        break
+
         return False
 
     def listen_continuous(self, callback, use_wake_word: bool = True):

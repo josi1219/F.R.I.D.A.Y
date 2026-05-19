@@ -52,6 +52,9 @@ class FridayEngine:
         self._listen_q: queue.Queue = queue.Queue()  # hotkey puts True here
         self._active_lock = threading.Lock()
         self._is_active   = False   # True while LISTENING/THINKING/SPEAKING
+        self._proactive_q: queue.Queue = queue.Queue()  # queued proactive speech
+        self._pre_duck_volume: int | None = None        # saved level before ducking
+        self._conversation_mode = False  # True = stay listening after each response
 
         # Import TTS here to avoid circular imports
         try:
@@ -83,6 +86,10 @@ class FridayEngine:
         # Start reminder polling thread
         r = threading.Thread(target=self._reminder_poll_loop, name="ReminderPoller", daemon=True)
         r.start()
+
+        # Start proactive speech queue processor
+        p = threading.Thread(target=self._proactive_loop, name="ProactiveLoop", daemon=True)
+        p.start()
 
         logger.info("FridayEngine started")
 
@@ -129,7 +136,13 @@ class FridayEngine:
             self._hotkey_only_loop()
             return
 
-        wake_available = self._listener._wake_model is not None
+        wake_available = (
+            self._listener._wake_model is not None   # OpenWakeWord model loaded
+            or (                                      # OR STT keyword spotter ready
+                bool(getattr(config, "WAKE_KEYWORD", ""))
+                and self._listener.ready              # any STT provider will do
+            )
+        )
 
         if wake_available:
             # Launch wake-word detector in its own thread; it posts to _listen_q
@@ -147,7 +160,30 @@ class FridayEngine:
             except queue.Empty:
                 continue
 
-            self._run_cycle()
+            # Any trigger enters conversation mode — keep listening until sleep phrase
+            self._conversation_mode = True
+            logger.info("Conversation mode: active")
+
+            while not self._stop_event.is_set() and self._conversation_mode:
+                got_speech = self._run_cycle()
+                if not got_speech:
+                    # Timed out waiting for speech — exit conversation mode silently
+                    self._conversation_mode = False
+                    logger.info("Conversation mode ended — no speech detected")
+                    break
+                if self._conversation_mode:
+                    import time as _ct
+                    _ct.sleep(0.5)  # brief gap so mic doesn't re-capture FRIDAY's voice
+                    # Drain any queued hotkey/wake-word triggers that arrived mid-conversation
+                    while not self._listen_q.empty():
+                        try:
+                            self._listen_q.get_nowait()
+                        except queue.Empty:
+                            break
+                    # Re-claim active slot for the next turn
+                    with self._active_lock:
+                        if not self._is_active:
+                            self._is_active = True
 
     def _hotkey_only_loop(self):
         """Fallback loop when voice input is unavailable — hotkey triggers only."""
@@ -167,22 +203,39 @@ class FridayEngine:
 
     def _wake_word_watcher(self):
         """Continuously listen for the wake word and post to _listen_q."""
+        import time
         while not self._stop_event.is_set():
             try:
+                # Don't open a second mic stream while already in conversation mode
+                if self._conversation_mode:
+                    time.sleep(0.3)
+                    continue
                 detected = self._listener.wait_for_wake_word()
                 if detected and not self._stop_event.is_set():
                     with self._active_lock:
                         if not self._is_active:
                             self._is_active = True
                             self._listen_q.put(True)
+                    # Wait until the triggered cycle fully finishes before re-opening
+                    # the mic for wake-word detection — prevents two simultaneous
+                    # sounddevice streams on the same device.
+                    while not self._stop_event.is_set():
+                        time.sleep(0.15)
+                        with self._active_lock:
+                            if not self._is_active:
+                                break
             except Exception as exc:
                 logger.error("Wake word watcher error: %s", exc)
-                import time
-                time.sleep(1)
+                import time as _time
+                _time.sleep(1)
 
-    def _run_cycle(self):
-        """Execute one full listen → think → speak cycle."""
+    def _run_cycle(self) -> bool:
+        """
+        Execute one full listen → think → speak cycle.
+        Returns True if speech was detected and processed, False if timed out.
+        """
         import time
+        got_speech = False
 
         try:
             # ── LISTENING ─────────────────────────────────────────────────
@@ -194,13 +247,29 @@ class FridayEngine:
 
             if not text.strip():
                 logger.info("No speech detected or empty transcription")
-                self._set_state("idle")
-                self._set_text("F.R.I.D.A.Y. ready")
-                with self._active_lock:
-                    self._is_active = False
-                return
+                return False  # finally will still run
 
+            got_speech = True
             logger.info("User: %s", text)
+
+            # ── Sleep phrase check ─────────────────────────────────────────
+            sleep_phrase = getattr(config, "SLEEP_PHRASE", "friday sleep").lower()
+            if sleep_phrase in text.lower():
+                logger.info("Sleep phrase detected — exiting conversation mode")
+                self._conversation_mode = False
+                goodbye = "Going to sleep. Say 'hey Jarvis' or press the hotkey when you need me."
+                if self._synthesize:
+                    try:
+                        self._set_state("speaking")
+                        self._duck_system_volume()
+                        audio = self._synthesize(goodbye)
+                        self._speaker.speak(audio)
+                    except Exception as exc:
+                        logger.error("TTS error on sleep: %s", exc)
+                    finally:
+                        self._restore_system_volume()
+                return True  # finally will still run
+
             self._set_state("thinking")
             self._set_text(text)
 
@@ -217,6 +286,8 @@ class FridayEngine:
             self._set_text("F.R.I.D.A.Y. ready")
             with self._active_lock:
                 self._is_active = False
+
+        return got_speech
 
     # ── Streaming respond ───────────────────────────────────────────────────
 
@@ -237,18 +308,22 @@ class FridayEngine:
 
         def _stream_and_split():
             buf = ""
-            for token in self._ai.chat_stream(user_text):
-                buf += token
-                full_parts.append(token)
-                parts = SENT_END.split(buf)
-                if len(parts) > 1:
-                    for s in parts[:-1]:
-                        if s.strip():
-                            sentence_q.put(s.strip())
-                    buf = parts[-1]
-            if buf.strip():
-                sentence_q.put(buf.strip())
-            sentence_q.put(None)  # sentinel
+            try:
+                for token in self._ai.chat_stream(user_text):
+                    buf += token
+                    full_parts.append(token)
+                    parts = SENT_END.split(buf)
+                    if len(parts) > 1:
+                        for s in parts[:-1]:
+                            if s.strip():
+                                sentence_q.put(s.strip())
+                        buf = parts[-1]
+                if buf.strip():
+                    sentence_q.put(buf.strip())
+            except Exception as exc:
+                logger.error("Stream thread error: %s", exc)
+            finally:
+                sentence_q.put(None)  # always send sentinel to unblock synthesizer
 
         def _synthesize_loop():
             while True:
@@ -274,8 +349,10 @@ class FridayEngine:
                 break
             if first:
                 self._set_state("speaking")
+                self._duck_system_volume()
                 first = False
             self._speaker.speak(audio)
+        self._restore_system_volume()
 
         t_stream.join(timeout=30)
         full_response = "".join(full_parts)
@@ -284,20 +361,22 @@ class FridayEngine:
             logger.info("Friday: %s", full_response)
             self._set_text(full_response[:120])
         else:
-            # Streaming yielded nothing — tool calls were made (AFC handles them
-            # in non-streaming mode). Re-send via blocking chat().
-            logger.info("Stream empty — falling back to blocking chat (tool call path)")
-            response = self._ai.chat(user_text) or \
-                "My AI uplink is unavailable at the moment, Sir."
+            # Streaming yielded nothing — transient error (chat was already reset).
+            # Do NOT re-send the same message; just let the user know.
+            logger.warning("Stream yielded nothing for: %s", user_text)
+            response = "I'm sorry, Sir — my connection dropped mid-response. Could you repeat that?"
             logger.info("Friday: %s", response)
             self._set_state("speaking")
             self._set_text(response[:120])
             if self._synthesize:
                 try:
+                    self._duck_system_volume()
                     audio = self._synthesize(response)
                     self._speaker.speak(audio)
                 except Exception as exc:
                     logger.error("TTS error: %s", exc)
+                finally:
+                    self._restore_system_volume()
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -313,20 +392,98 @@ class FridayEngine:
         except Exception:
             pass
 
-    # ── Proactive speaking ─────────────────────────────────────────────────
+    # ── Volume ducking ──────────────────────────────────────────────
+
+    def _duck_system_volume(self) -> None:
+        """Lower system volume before FRIDAY speaks. Saves the original level."""
+        duck_amount = getattr(config, "VOLUME_DUCK_AMOUNT", 40)
+        if not duck_amount:
+            self._pre_duck_volume = None
+            return
+        try:
+            from ctypes import cast, POINTER
+            from comtypes import CLSCTX_ALL
+            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+            devices   = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            vol       = cast(interface, POINTER(IAudioEndpointVolume))
+            current   = int(round(vol.GetMasterVolumeLevelScalar() * 100))
+            target    = max(0, current - duck_amount)
+            self._pre_duck_volume = current
+            if target < current:
+                vol.SetMasterVolumeLevelScalar(target / 100.0, None)
+        except Exception:
+            self._pre_duck_volume = None
+
+    def _restore_system_volume(self) -> None:
+        """Restore the volume saved by _duck_system_volume."""
+        level = self._pre_duck_volume
+        self._pre_duck_volume = None
+        if level is None:
+            return
+        try:
+            from ctypes import cast, POINTER
+            from comtypes import CLSCTX_ALL
+            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+            devices   = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            cast(interface, POINTER(IAudioEndpointVolume)).SetMasterVolumeLevelScalar(
+                level / 100.0, None
+            )
+        except Exception:
+            pass
+
+    # ── Proactive speaking ────────────────────────────────────────────
+
+    def _proactive_loop(self) -> None:
+        """
+        Drain the proactive speech queue without overlapping an active voice cycle.
+        Waits for any in-progress cycle to finish, then claims the active slot
+        before playing so no new cycle can start during proactive speech.
+        """
+        import time
+        while not self._stop_event.is_set():
+            try:
+                text = self._proactive_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            # Wait for any active cycle to finish
+            while not self._stop_event.is_set():
+                with self._active_lock:
+                    if not self._is_active:
+                        break
+                time.sleep(0.2)
+            if self._stop_event.is_set():
+                break
+            # Claim the active slot
+            with self._active_lock:
+                if self._is_active:
+                    # A new cycle snuck in — requeue and try again later
+                    self._proactive_q.put(text)
+                    continue
+                self._is_active = True
+            try:
+                self._speak_proactive(text)
+            finally:
+                with self._active_lock:
+                    self._is_active = False
 
     def _speak_proactive(self, text: str) -> None:
         """Speak a message outside of the normal voice cycle (e.g. reminder alerts)."""
+        import time
         try:
             self._set_state("speaking")
             self._set_text(text[:120])
             if self._synthesize:
-                audio = self._synthesize(text)
-                self._speaker.speak(audio)
+                self._duck_system_volume()
+                try:
+                    audio = self._synthesize(text)
+                    self._speaker.speak(audio)
+                finally:
+                    self._restore_system_volume()
         except Exception as exc:
             logger.error("Proactive speech error: %s", exc)
         finally:
-            import time
             time.sleep(0.5)
             self._set_state("idle")
             self._set_text("F.R.I.D.A.Y. ready")
@@ -385,4 +542,4 @@ class FridayEngine:
                     continue
 
                 logger.info("Reminder fired: %s", row["text"])
-                self._speak_proactive(f"Sir, just a reminder: {row['text']}")
+                self._proactive_q.put(f"Sir, just a reminder: {row['text']}")
