@@ -106,7 +106,7 @@ VOLUME_DUCK_AMOUNT      = int(os.getenv("VOLUME_DUCK_AMOUNT", "40"))
 
 # ── Conversation mode ────────────────────────────────────────────────────────
 # Phrase that exits continuous conversation mode and returns to idle/wake-word
-SLEEP_PHRASE = os.getenv("SLEEP_PHRASE", "friday sleep").lower()
+SLEEP_PHRASE = os.getenv("SLEEP_PHRASE", "sleep").lower()
 
 # ── Wake keyword (STT-based spotter) ─────────────────────────────────────────
 # Any phrase containing this word will trigger wake-up (e.g. "hey friday",
