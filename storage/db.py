@@ -48,5 +48,20 @@ def init_db() -> None:
                 context    TEXT,
                 created_at TEXT    DEFAULT (datetime('now','localtime'))
             );
+
+            CREATE TABLE IF NOT EXISTS stock_watchlist (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol     TEXT    NOT NULL UNIQUE,
+                asset_type TEXT    NOT NULL DEFAULT 'crypto',
+                added_at   TEXT    DEFAULT (datetime('now','localtime')),
+                active     INTEGER DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                role       TEXT    NOT NULL,
+                content    TEXT    NOT NULL,
+                logged_at  TEXT    DEFAULT (datetime('now','localtime'))
+            );
         """)
         conn.commit()

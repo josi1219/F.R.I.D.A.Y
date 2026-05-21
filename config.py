@@ -126,3 +126,20 @@ VAD_SILENCE_THRESHOLD = float(os.getenv("VAD_SILENCE_THRESHOLD", "0.003"))
 # ── Overlay ──────────────────────────────────────────────────────────────────
 OVERLAY_OPACITY  = float(os.getenv("OVERLAY_OPACITY",  "0.92"))
 OVERLAY_POSITION = os.getenv("OVERLAY_POSITION", "bottom-right")
+
+# ── Proactive Monitor ─────────────────────────────────────────────────────────
+MONITOR_CPU_THRESHOLD    = int(os.getenv("MONITOR_CPU_THRESHOLD",    "90"))    # % to trigger alert
+MONITOR_RAM_THRESHOLD    = int(os.getenv("MONITOR_RAM_THRESHOLD",    "90"))    # % to trigger alert
+MONITOR_CPU_COOLDOWN     = int(os.getenv("MONITOR_CPU_COOLDOWN",    "300"))    # seconds between alerts
+MONITOR_BATTERY_LOW      = int(os.getenv("MONITOR_BATTERY_LOW",      "20"))    # % battery warning
+MONITOR_BATTERY_COOLDOWN = int(os.getenv("MONITOR_BATTERY_COOLDOWN", "600"))   # seconds
+MONITOR_WORK_SESSION_MIN = int(os.getenv("MONITOR_WORK_SESSION_MIN", "120"))   # minutes before break
+MONITOR_WORK_BREAK_CDN   = int(os.getenv("MONITOR_WORK_BREAK_CDN",   "60"))    # minutes between nags
+MONITOR_POLL_INTERVAL    = int(os.getenv("MONITOR_POLL_INTERVAL",    "30"))    # seconds
+MONITOR_STOCK_INTERVAL   = int(os.getenv("MONITOR_STOCK_INTERVAL",  "300"))    # seconds (5 min)
+MONITOR_STOCK_THRESHOLD  = float(os.getenv("MONITOR_STOCK_THRESHOLD",  "5.0")) # % change to alert
+
+# ── Morning Briefing ──────────────────────────────────────────────────────────
+MORNING_BRIEFING_ENABLED    = os.getenv("MORNING_BRIEFING_ENABLED", "true").lower() == "true"
+MORNING_BRIEFING_START_HOUR = int(os.getenv("MORNING_BRIEFING_START_HOUR", "5"))   # 5 AM
+MORNING_BRIEFING_END_HOUR   = int(os.getenv("MORNING_BRIEFING_END_HOUR",  "11"))   # 11 AM

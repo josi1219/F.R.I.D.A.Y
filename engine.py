@@ -92,6 +92,20 @@ class FridayEngine:
         p = threading.Thread(target=self._proactive_loop, name="ProactiveLoop", daemon=True)
         p.start()
 
+        # Start proactive background monitor (CPU/RAM/battery/stocks/work-timer)
+        try:
+            from services.monitor import ProactiveMonitor
+            self._monitor = ProactiveMonitor(self)
+            self._monitor.start()
+        except Exception as exc:
+            logger.warning("ProactiveMonitor failed to start: %s", exc)
+            self._monitor = None
+
+        # Morning briefing — fires 4 seconds after start if within briefing hours
+        if getattr(config, "MORNING_BRIEFING_ENABLED", True):
+            mb = threading.Thread(target=self._morning_briefing, name="MorningBriefing", daemon=True)
+            mb.start()
+
         logger.info("FridayEngine started")
 
     def stop(self):
@@ -104,11 +118,112 @@ class FridayEngine:
                 kb.unhook_all()
             except Exception:
                 pass
+        if getattr(self, "_monitor", None):
+            self._monitor.stop()
         logger.info("FridayEngine stopped")
 
     def trigger_listen(self):
         """Programmatically trigger one listen cycle (same as pressing hotkey)."""
         self._hotkey_triggered()
+
+    # ── Morning Briefing ────────────────────────────────────────────────────
+
+    def _morning_briefing(self) -> None:
+        """
+        Fires once at startup if the local time is within the briefing window
+        (default 05:00–11:00). Compiles a spoken briefing: time, weather, tasks,
+        reminders, and any watched assets that moved overnight.
+        """
+        import time
+        import datetime
+        time.sleep(4)  # Let the engine fully boot first
+
+        if self._stop_event.is_set():
+            return
+
+        hour = datetime.datetime.now().hour
+        start_h = getattr(config, "MORNING_BRIEFING_START_HOUR", 5)
+        end_h   = getattr(config, "MORNING_BRIEFING_END_HOUR",  11)
+        if not (start_h <= hour < end_h):
+            return
+
+        try:
+            parts: list[str] = []
+
+            # Time & greeting
+            now_str = datetime.datetime.now().strftime("%I:%M %p").lstrip("0")
+            greeting = "Good morning" if hour < 12 else "Good afternoon"
+            parts.append(f"{greeting}, Sir. It's {now_str}.")
+
+            # Weather (reuse existing tool)
+            try:
+                from services.tools import get_weather
+                weather = get_weather()
+                if weather and "error" not in weather.lower():
+                    # strip verbose prefix if present
+                    w = weather.split(":", 1)[-1].strip()
+                    parts.append(w)
+            except Exception:
+                pass
+
+            # Pending tasks
+            try:
+                from storage.db import get_conn
+                with get_conn() as conn:
+                    task_count = conn.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE done = 0"
+                    ).fetchone()[0]
+                if task_count:
+                    parts.append(
+                        f"You have {task_count} pending task{'s' if task_count != 1 else ''}."
+                    )
+            except Exception:
+                pass
+
+            # Upcoming reminders (next 24 h)
+            try:
+                from storage.db import get_conn
+                cutoff = (datetime.datetime.now() + datetime.timedelta(hours=24)).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+                with get_conn() as conn:
+                    reminders = conn.execute(
+                        "SELECT text, due_time FROM reminders WHERE done = 0 "
+                        "AND due_time IS NOT NULL AND due_time <= ? "
+                        "ORDER BY due_time LIMIT 3",
+                        (cutoff,),
+                    ).fetchall()
+                if reminders:
+                    rem_list = "; ".join(
+                        f"{r['text']} at {r['due_time'][-5:]}" for r in reminders
+                    )
+                    parts.append(f"Upcoming reminder{'s' if len(reminders) > 1 else ''}: {rem_list}.")
+            except Exception:
+                pass
+
+            # Stock/crypto snapshot
+            try:
+                from services.monitor import _get_watchlist, _fetch_price
+                watchlist = _get_watchlist()
+                if watchlist:
+                    snippets = []
+                    for item in watchlist[:3]:  # top 3 to keep briefing short
+                        price = _fetch_price(item["symbol"], item["asset_type"])
+                        if price:
+                            snippets.append(f"{item['symbol']} at ${price:,.2f}")
+                    if snippets:
+                        parts.append("Watchlist: " + ", ".join(snippets) + ".")
+            except Exception:
+                pass
+
+            parts.append("Shall I go over anything in detail?")
+
+            briefing = " ".join(parts)
+            logger.info("Morning briefing: %s", briefing)
+            self._proactive_q.put(briefing)
+
+        except Exception as exc:
+            logger.error("Morning briefing error: %s", exc)
 
     # ── Internal ───────────────────────────────────────────────────────────
 
@@ -258,6 +373,10 @@ class FridayEngine:
 
             got_speech = True
             logger.info("User: %s", text)
+
+            # Reset monitor session timer — user is active
+            if getattr(self, "_monitor", None):
+                self._monitor.reset_session_timer()
 
             # ── Sleep phrase check ─────────────────────────────────────────
             sleep_phrase = getattr(config, "SLEEP_PHRASE", "friday sleep").lower()

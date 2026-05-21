@@ -1336,6 +1336,473 @@ def run_shell_command(command: str) -> str:
         return f"Shell command error: {exc}"
 
 
+# ── Stock / Crypto Watchlist ──────────────────────────────────────────────────
+
+def add_to_watchlist(symbol: str, asset_type: str = "crypto") -> str:
+    """
+    Add a stock or cryptocurrency to the price-alert watchlist.
+    symbol: ticker symbol, e.g. 'BTC', 'ETH', 'AAPL', 'TSLA'.
+    asset_type: 'crypto' for cryptocurrencies, 'stock' for equities.
+    Friday will alert you when the price moves significantly.
+    """
+    symbol = symbol.upper().strip()
+    asset_type = asset_type.lower().strip()
+    if asset_type not in ("crypto", "stock"):
+        asset_type = "crypto"
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO stock_watchlist (symbol, asset_type, active) VALUES (?, ?, 1)",
+                (symbol, asset_type),
+            )
+            conn.commit()
+        return f"Added {symbol} ({asset_type}) to your watchlist. I'll alert you on big moves."
+    except Exception as exc:
+        return f"Watchlist add error: {exc}"
+
+
+def remove_from_watchlist(symbol: str) -> str:
+    """
+    Remove a symbol from the price-alert watchlist.
+    symbol: ticker symbol to remove, e.g. 'BTC', 'AAPL'.
+    """
+    symbol = symbol.upper().strip()
+    try:
+        with get_conn() as conn:
+            conn.execute("UPDATE stock_watchlist SET active = 0 WHERE symbol = ?", (symbol,))
+            conn.commit()
+        return f"Removed {symbol} from your watchlist."
+    except Exception as exc:
+        return f"Watchlist remove error: {exc}"
+
+
+def list_watchlist() -> str:
+    """List all symbols currently on your price-alert watchlist with their latest prices."""
+    try:
+        from services.monitor import _fetch_price, _get_watchlist
+        items = _get_watchlist()
+        if not items:
+            return "Watchlist is empty. Add symbols with 'add BTC to my watchlist'."
+        lines = []
+        for item in items:
+            price = _fetch_price(item["symbol"], item["asset_type"])
+            price_str = f"${price:,.2f}" if price else "price unavailable"
+            lines.append(f"{item['symbol']} ({item['asset_type']}) — {price_str}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Watchlist list error: {exc}"
+
+
+def get_price(symbol: str, asset_type: str = "crypto") -> str:
+    """
+    Get the current price of a cryptocurrency or stock.
+    symbol: ticker symbol, e.g. 'BTC', 'ETH', 'AAPL', 'TSLA', 'SPY'.
+    asset_type: 'crypto' or 'stock'.
+    """
+    symbol = symbol.upper().strip()
+    try:
+        from services.monitor import _fetch_price
+        price = _fetch_price(symbol, asset_type.lower())
+        if price:
+            return f"{symbol} is currently at ${price:,.2f}"
+        return f"Could not fetch price for {symbol}. Check the symbol and try again."
+    except Exception as exc:
+        return f"Price fetch error: {exc}"
+
+
+# ── Code Execution ────────────────────────────────────────────────────────────
+
+def execute_python_code(code: str, description: str = "") -> str:
+    """
+    Write and execute a Python script, returning its output.
+    Use this to perform calculations, data processing, file operations,
+    automation scripts, or any task that benefits from running code.
+    For complex multi-file projects, call this multiple times to build
+    and iterate. Friday will write the code, run it, and report results.
+
+    code: valid Python source code to execute.
+    description: brief description of what this code does (for logging).
+
+    The code runs with a 60-second timeout. stdout and stderr are captured
+    and returned. The working directory is the user's home folder.
+    """
+    import tempfile
+    import subprocess as _sp
+
+    if not code.strip():
+        return "No code provided."
+
+    desc_log = description or "user-requested script"
+    logger = __import__("logging").getLogger(__name__)
+    logger.info("Executing code: %s", desc_log)
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(code)
+            tmp_path = tmp.name
+
+        result = _sp.run(
+            [sys.executable, tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=os.path.expanduser("~"),
+        )
+        output = (result.stdout + result.stderr).strip()
+        exit_code = result.returncode
+
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        if exit_code == 0:
+            return output[:4000] if output else "(script completed with no output)"
+        else:
+            return f"Script exited with code {exit_code}:\n{output[:4000]}"
+
+    except _sp.TimeoutExpired:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        return "Script timed out after 60 seconds."
+    except Exception as exc:
+        return f"Code execution error: {exc}"
+
+
+def execute_shell_script(script: str, shell: str = "powershell") -> str:
+    """
+    Write and execute a shell script (PowerShell or CMD batch).
+    Use this for Windows automation, system administration, or
+    tasks that are cleaner in shell than in Python.
+
+    script: the shell script content to execute.
+    shell: 'powershell' (default) or 'cmd'.
+    Returns stdout + stderr, capped at 4000 characters.
+    """
+    import tempfile
+    import subprocess as _sp
+
+    if not script.strip():
+        return "No script provided."
+
+    try:
+        if shell == "cmd":
+            suffix = ".bat"
+            cmd = ["cmd", "/c"]
+        else:
+            suffix = ".ps1"
+            cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File"]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=suffix, delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(script)
+            tmp_path = tmp.name
+
+        result = _sp.run(
+            cmd + [tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=os.path.expanduser("~"),
+        )
+        output = (result.stdout + result.stderr).strip()
+
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        return output[:4000] if output else "(no output)"
+
+    except _sp.TimeoutExpired:
+        return "Script timed out after 30 seconds."
+    except Exception as exc:
+        return f"Shell script error: {exc}"
+
+
+# ── Document Intelligence ─────────────────────────────────────────────────────
+
+def analyze_document(path: str, question: str = "Summarize this document.") -> str:
+    """
+    Read and analyze any document: PDF, Word (.docx), plain text, or image.
+    Extracts the text content and sends it to Gemini for intelligent analysis.
+    Use this when the user wants to: summarize a contract, read a report,
+    extract key points from a PDF, analyze a Word document, or ask questions
+    about any file's content.
+
+    path: absolute path to the document file.
+    question: what to ask about the document, e.g. 'What are the key terms?'
+              Defaults to a full summary.
+    """
+    import pathlib
+
+    path = os.path.expandvars(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        return f"File not found: {path}"
+
+    suffix = pathlib.Path(path).suffix.lower()
+    text   = ""
+
+    try:
+        # ── PDF ─────────────────────────────────────────────────────────
+        if suffix == ".pdf":
+            try:
+                import fitz  # PyMuPDF
+                doc = fitz.open(path)
+                pages = [page.get_text() for page in doc]
+                text = "\n\n".join(pages)
+                doc.close()
+            except ImportError:
+                return (
+                    "PyMuPDF not installed — run: pip install pymupdf\n"
+                    "Then retry."
+                )
+
+        # ── Word (.docx) ──────────────────────────────────────────────
+        elif suffix in (".docx", ".doc"):
+            try:
+                import docx
+                doc = docx.Document(path)
+                text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            except ImportError:
+                return (
+                    "python-docx not installed — run: pip install python-docx\n"
+                    "Then retry."
+                )
+
+        # ── Plain text / code ─────────────────────────────────────────
+        elif suffix in (".txt", ".md", ".py", ".js", ".ts", ".json", ".csv",
+                        ".html", ".xml", ".yaml", ".yml", ".log"):
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read(40000)
+
+        # ── Image — use Gemini Vision ─────────────────────────────────
+        elif suffix in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+            try:
+                from PIL import Image as _Image
+                import io
+                img  = _Image.open(path)
+                buf  = io.BytesIO()
+                img.save(buf, format="PNG")
+                img_bytes = buf.getvalue()
+
+                client, model = _get_vision_client()
+                if client is None:
+                    return "Gemini Vision not available."
+
+                from google.genai import types as _gt
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[
+                        question,
+                        _gt.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    ],
+                )
+                return response.text.strip()
+            except Exception as exc:
+                return f"Image analysis error: {exc}"
+
+        else:
+            return f"Unsupported file type: {suffix}"
+
+        if not text.strip():
+            return "Document appears to be empty or could not be read."
+
+        # ── Send extracted text to Gemini ─────────────────────────────
+        client, model = _get_vision_client()
+        if client is None:
+            return f"Gemini not available. Extracted text (first 2000 chars):\n{text[:2000]}"
+
+        # Cap at 30 000 chars to stay within token limits
+        capped = text[:30000]
+        prompt = (
+            f"The following is the content of a document ({os.path.basename(path)}):\n\n"
+            f"{capped}\n\n"
+            f"---\n{question}"
+        )
+        response = client.models.generate_content(model=model, contents=prompt)
+        return response.text.strip()
+
+    except Exception as exc:
+        return f"Document analysis error: {exc}"
+
+
+# ── Web Research ──────────────────────────────────────────────────────────────
+
+def fetch_webpage_text(url: str, question: str = "") -> str:
+    """
+    Fetch the text content of a web page and optionally answer a question about it.
+    url: full URL to fetch, e.g. 'https://en.wikipedia.org/wiki/Python'.
+    question: optional question to answer based on the page content.
+    Use this for research, reading articles, checking documentation, and web scraping.
+    """
+    if not HAS_REQUESTS:
+        return "requests library not available."
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        resp = req_lib.get(url, headers=headers, timeout=12)
+        resp.raise_for_status()
+
+        # Strip HTML tags
+        html = resp.text
+        try:
+            from html.parser import HTMLParser
+
+            class _StripHTML(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.parts: list[str] = []
+                    self._skip = False
+
+                def handle_starttag(self, tag, attrs):
+                    if tag in ("script", "style", "nav", "footer", "header"):
+                        self._skip = True
+
+                def handle_endtag(self, tag):
+                    if tag in ("script", "style", "nav", "footer", "header"):
+                        self._skip = False
+
+                def handle_data(self, data):
+                    if not self._skip and data.strip():
+                        self.parts.append(data.strip())
+
+            parser = _StripHTML()
+            parser.feed(html)
+            text = " ".join(parser.parts)
+        except Exception:
+            import re
+            text = re.sub(r"<[^>]+>", " ", html)
+
+        # Collapse whitespace
+        import re
+        text = re.sub(r"\s+", " ", text).strip()[:20000]
+
+        if not question:
+            return text[:5000]
+
+        # Ask Gemini about the page
+        client, model = _get_vision_client()
+        if client is None:
+            return text[:5000]
+
+        prompt = (
+            f"Based on this web page content from {url}:\n\n"
+            f"{text[:15000]}\n\n"
+            f"---\nAnswer this question: {question}"
+        )
+        response = client.models.generate_content(model=model, contents=prompt)
+        return response.text.strip()
+
+    except Exception as exc:
+        return f"Web fetch error: {exc}"
+
+
+def research_topic(goal: str, save_report: bool = False) -> str:
+    """
+    Autonomously research a topic by searching the web and synthesizing findings.
+    Searches multiple sources, reads key pages, and produces a comprehensive report.
+    Use for: 'Research the best laptops under $1000', 'Compare Python vs JavaScript',
+    'What are the latest developments in AI?', 'Find me the top 3 X for Y'.
+
+    goal: the research question or goal.
+    save_report: if True, save the report to a file on the Desktop.
+    """
+    if not HAS_REQUESTS:
+        return "requests library not available for web research."
+
+    import re
+
+    results_text: list[str] = []
+
+    try:
+        # Step 1: Get Google search result URLs via DuckDuckGo HTML
+        search_url = f"https://html.duckduckgo.com/html/?q={_qp(goal)}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        resp = req_lib.get(search_url, headers=headers, timeout=10)
+        urls: list[str] = re.findall(
+            r'href="(https?://[^"&]+)"', resp.text
+        )
+        # Filter out tracking/ad URLs
+        clean_urls = [
+            u for u in urls
+            if not any(x in u for x in ("duckduckgo", "google.com/search", "bing.com", "ad."))
+        ][:5]  # top 5 sources
+
+        if not clean_urls:
+            return f"Could not find relevant sources for: {goal}"
+
+        # Step 2: Fetch each page
+        for url in clean_urls:
+            try:
+                content = fetch_webpage_text(url)
+                if content and len(content) > 200:
+                    results_text.append(f"Source: {url}\n{content[:3000]}")
+            except Exception:
+                continue
+
+        if not results_text:
+            return "Could not retrieve content from any sources."
+
+        combined = "\n\n---\n\n".join(results_text)
+
+        # Step 3: Ask Gemini to synthesize
+        client, model = _get_vision_client()
+        if client is None:
+            return "Gemini not available for synthesis."
+
+        prompt = (
+            f"You are conducting research on behalf of the user. "
+            f"Research goal: {goal}\n\n"
+            f"Here is the content gathered from {len(results_text)} web sources:\n\n"
+            f"{combined[:25000]}\n\n"
+            f"---\n"
+            f"Write a comprehensive, well-structured research report answering the goal. "
+            f"Include key findings, comparisons, recommendations, and cite sources where relevant. "
+            f"Be specific, practical, and useful."
+        )
+        response = client.models.generate_content(model=model, contents=prompt)
+        report   = response.text.strip()
+
+        if save_report:
+            try:
+                import datetime
+                filename  = re.sub(r"[^\w\s-]", "", goal)[:40].strip().replace(" ", "_")
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                filepath  = os.path.join(
+                    os.path.expanduser("~"), "Desktop",
+                    f"FRIDAY_Research_{filename}_{timestamp}.txt"
+                )
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(f"Research Goal: {goal}\n")
+                    f.write(f"Date: {datetime.datetime.now().strftime('%B %d, %Y %I:%M %p')}\n")
+                    f.write(f"Sources consulted: {len(results_text)}\n\n")
+                    f.write(report)
+                return report + f"\n\n[Report saved to Desktop: {os.path.basename(filepath)}]"
+            except Exception as exc:
+                return report + f"\n\n(Could not save report: {exc})"
+
+        return report
+
+    except Exception as exc:
+        return f"Research error: {exc}"
+
+
 # ── Tool registry ─────────────────────────────────────────────────────────────
 
 TOOL_MAP: dict = {fn.__name__: fn for fn in [
@@ -1423,6 +1890,19 @@ TOOL_MAP: dict = {fn.__name__: fn for fn in [
     forget_fact,
     # Shell
     run_shell_command,
+    # Stock / Crypto watchlist
+    add_to_watchlist,
+    remove_from_watchlist,
+    list_watchlist,
+    get_price,
+    # Code execution
+    execute_python_code,
+    execute_shell_script,
+    # Document intelligence
+    analyze_document,
+    # Web research
+    fetch_webpage_text,
+    research_topic,
 ]}
 
 ALL_TOOLS: list = list(TOOL_MAP.values())
