@@ -1794,17 +1794,29 @@ def research_topic(goal: str, save_report: bool = False) -> str:
         if not clean_urls:
             return f"Could not find relevant sources for: {goal}"
 
-        # Step 2: Fetch each page; fall back to DDG/SearXNG snippet if page is unreachable
-        for url in clean_urls:
+        # Step 2: Fetch all pages in parallel — 6 threads, 20s total cap
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _fetch_one(url: str):
             try:
                 content = fetch_webpage_text(url)
                 if content and len(content) > 200 and not content.startswith("Web fetch error"):
-                    results_text.append(f"Source: {url}\n{content[:3500]}")
-                elif snippets.get(url):
-                    results_text.append(f"Source: {url}\n{snippets[url]}")
+                    return url, content[:3500]
             except Exception:
-                if snippets.get(url):
-                    results_text.append(f"Source: {url}\n{snippets[url]}")
+                pass
+            return url, None
+
+        with ThreadPoolExecutor(max_workers=6) as _pool:
+            _futures = {_pool.submit(_fetch_one, u): u for u in clean_urls}
+            for _fut in as_completed(_futures, timeout=20):
+                try:
+                    _url, _content = _fut.result()
+                    if _content:
+                        results_text.append(f"Source: {_url}\n{_content}")
+                    elif snippets.get(_url):
+                        results_text.append(f"Source: {_url}\n{snippets[_url]}")
+                except Exception:
+                    pass
 
         if not results_text:
             return "Could not retrieve content from any sources."
