@@ -55,6 +55,7 @@ class FridayEngine:
         self._proactive_q: queue.Queue = queue.Queue()  # queued proactive speech
         self._pre_duck_volume: int | None = None        # saved level before ducking
         self._conversation_mode = False  # True = stay listening after each response
+        self._is_sleeping       = False  # True = sleep mode, waiting for wake word/hotkey
 
         # Import TTS here to avoid circular imports
         try:
@@ -137,11 +138,9 @@ class FridayEngine:
             return
 
         wake_available = (
-            self._listener._wake_model is not None   # OpenWakeWord model loaded
-            or (                                      # OR STT keyword spotter ready
-                bool(getattr(config, "WAKE_KEYWORD", ""))
-                and self._listener.ready              # any STT provider will do
-            )
+            self._listener._wake_model is not None        # model already loaded
+            or bool(getattr(config, "WAKE_WORD_MODEL", ""))  # model configured (may still be loading)
+            or (bool(getattr(config, "WAKE_KEYWORD", "")) and self._listener.ready)
         )
 
         if wake_available:
@@ -161,6 +160,7 @@ class FridayEngine:
                 continue
 
             # Any trigger enters conversation mode — keep listening until sleep phrase
+            self._is_sleeping = False
             self._conversation_mode = True
             logger.info("Conversation mode: active")
 
@@ -208,9 +208,13 @@ class FridayEngine:
             try:
                 # Don't open a second mic stream while already in conversation mode
                 if self._conversation_mode:
-                    time.sleep(0.3)
+                    time.sleep(0.05)
                     continue
                 detected = self._listener.wait_for_wake_word()
+                if not detected:
+                    # Model not ready yet or stop event fired — back off before retrying
+                    time.sleep(1.0)
+                    continue
                 if detected and not self._stop_event.is_set():
                     with self._active_lock:
                         if not self._is_active:
@@ -224,6 +228,9 @@ class FridayEngine:
                         with self._active_lock:
                             if not self._is_active:
                                 break
+                    # Brief cooldown before re-opening the stream so any residual
+                    # mic audio from the just-finished cycle drains away.
+                    time.sleep(0.4)
             except Exception as exc:
                 logger.error("Wake word watcher error: %s", exc)
                 import time as _time
@@ -257,7 +264,8 @@ class FridayEngine:
             if sleep_phrase in text.lower():
                 logger.info("Sleep phrase detected — exiting conversation mode")
                 self._conversation_mode = False
-                goodbye = "Going to sleep. Say 'hey Jarvis' or press the hotkey when you need me."
+                self._is_sleeping = True
+                goodbye = "Going to sleep."
                 if self._synthesize:
                     try:
                         self._set_state("speaking")
@@ -282,8 +290,13 @@ class FridayEngine:
         except Exception as exc:
             logger.error("Voice cycle error: %s", exc)
         finally:
-            self._set_state("idle")
-            self._set_text("F.R.I.D.A.Y. ready")
+            if self._is_sleeping:
+                self._set_state("sleeping")
+                hotkey = getattr(config, "HOTKEY_ACTIVATE", "ctrl+alt+f")
+                self._set_text(f"Sleeping... say 'hey Jarvis' or press {hotkey}")
+            else:
+                self._set_state("idle")
+                self._set_text("F.R.I.D.A.Y. ready")
             with self._active_lock:
                 self._is_active = False
 

@@ -37,12 +37,14 @@ STATE_IDLE      = "idle"
 STATE_LISTENING = "listening"
 STATE_THINKING  = "thinking"
 STATE_SPEAKING  = "speaking"
+STATE_SLEEPING  = "sleeping"
 
 _STATE_COLORS = {
     STATE_IDLE:      QColor(60,  120, 220, 180) if HAS_QT else None,   # dim blue
     STATE_LISTENING: QColor(40,  210,  80, 220) if HAS_QT else None,   # bright green
     STATE_THINKING:  QColor(240, 160,  20, 220) if HAS_QT else None,   # amber
     STATE_SPEAKING:  QColor(120,  60, 220, 220) if HAS_QT else None,   # purple
+    STATE_SLEEPING:  QColor(50,   60,  90, 110) if HAS_QT else None,   # very dim dark blue
 }
 
 
@@ -138,6 +140,7 @@ if HAS_QT:
                 STATE_LISTENING: 0.06,
                 STATE_THINKING:  0.08,
                 STATE_SPEAKING:  0.05,
+                STATE_SLEEPING:  0.003,  # very slow breathing pulse
             }.get(self._state, 0.02)
             self._anim_phase = (self._anim_phase + speed) % 1.0
             self.update()
@@ -202,6 +205,7 @@ if HAS_QT:
                 STATE_LISTENING: "LISTENING",
                 STATE_THINKING:  "PROCESSING",
                 STATE_SPEAKING:  "SPEAKING",
+                STATE_SLEEPING:  "SLEEPING",
             }.get(self._state, "")
             label_color = QColor(color)
             label_color.setAlpha(200)

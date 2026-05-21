@@ -109,10 +109,10 @@ VOLUME_DUCK_AMOUNT      = int(os.getenv("VOLUME_DUCK_AMOUNT", "40"))
 SLEEP_PHRASE = os.getenv("SLEEP_PHRASE", "sleep").lower()
 
 # ── Wake keyword (STT-based spotter) ─────────────────────────────────────────
-# Any phrase containing this word will trigger wake-up (e.g. "hey friday",
-# "chop chop friday", just "friday").  Uses Groq Whisper for fast detection
-# regardless of the main STT_PROVIDER setting.
-WAKE_KEYWORD       = os.getenv("WAKE_KEYWORD", "friday").lower()
+# Leave empty (default) to use the local OpenWakeWord model (hey_jarvis) for
+# fast, offline wake detection — no API round-trip required.
+# Set to a non-empty word (e.g. "friday") only to override with STT-based spotting.
+WAKE_KEYWORD       = os.getenv("WAKE_KEYWORD", "").lower()
 # Ultra-low RMS threshold for capturing audio bursts in keyword-spotter mode.
 # Lower = more sensitive (even a whisper triggers a transcription check).
 WAKE_VAD_THRESHOLD = float(os.getenv("WAKE_VAD_THRESHOLD", "0.001"))

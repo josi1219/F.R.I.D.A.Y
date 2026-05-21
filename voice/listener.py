@@ -297,6 +297,19 @@ class VoiceListener:
         )
 
         with stream:
+            # ── Flush stale mic buffer on stream open ──────────────────────
+            # Without this, audio buffered while _is_active was True (the user
+            # saying "hey jarvis" repeatedly while Friday was busy) feeds into
+            # the model the instant the stream opens → immediate false trigger.
+            flush_chunks = int(0.75 * SAMPLE_RATE / WAKE_CHUNK)  # ~9 chunks
+            flushed = 0
+            while flushed < flush_chunks and not self._stop_event.is_set():
+                try:
+                    chunk_q.get(timeout=0.1)
+                    flushed += 1
+                except queue.Empty:
+                    break
+
             while not self._stop_event.is_set():
                 if timeout > 0 and time.time() - start > timeout:
                     return False
@@ -308,9 +321,10 @@ class VoiceListener:
                 mono = chunk[:, 0] if chunk.ndim > 1 else chunk
                 try:
                     preds = self._wake_model.predict(mono)
-                    model_name = getattr(config, "WAKE_WORD_MODEL", "hey_jarvis")
-                    score = preds.get(model_name, 0.0)
-                    if score > 0.5:
+                    # Use max score across all models — robust against key name variations
+                    # (e.g. "hey_jarvis" vs "hey_jarvis_v0.1")
+                    score = max(preds.values()) if preds else 0.0
+                    if score > 0.6:
                         logger.info("Wake word detected (score=%.2f)", score)
                         return True
                 except Exception:
