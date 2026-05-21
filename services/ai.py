@@ -153,6 +153,16 @@ Web research:
   reads multiple sources, and synthesizes a comprehensive report.
   Set save_report=True to save the report to the user's Desktop.
 - For research tasks: always announce what you are researching, then call research_topic.
+
+Messaging:
+- Use send_telegram_message(contact, message) to send a Telegram message.
+  contact can be a display name like 'John' or a @username — Friday will search the app.
+- Use send_whatsapp_message(contact, message) to send a WhatsApp message.
+  contact is either the person's saved name (e.g. 'Mom') or a phone number with country code.
+- Use send_discord_message(contact, message) to send a Discord DM.
+  contact is the person's Discord display name or username.
+- These tools open the desktop app, search for the contact by name, and send automatically.
+- Never ask for a phone number or username if the user already gave you a name — use it directly.
 """
 
 try:

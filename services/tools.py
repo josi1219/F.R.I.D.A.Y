@@ -332,6 +332,120 @@ def search_maps(query: str) -> str:
     return f"Opened Google Maps search for: {query}"
 
 
+# ── Messaging ─────────────────────────────────────────────────────────────────
+
+def send_telegram_message(contact: str, message: str) -> str:
+    """
+    Open Telegram Desktop, search for a contact by name or username, and send a message.
+    contact: the person's display name or username — passed as-is, no @ prefix added.
+    message: the text to send.
+    """
+    try:
+        import time as _t
+        import pyperclip
+        from automation.mouse_keyboard import press_key, hotkey
+
+        contact = contact.strip().lstrip("@")
+
+        # Always use UI search — open app, search by name/username, open chat, send
+        subprocess.Popen('start "" "tg://"', shell=True)
+        _t.sleep(3)
+        press_key("escape")          # make sure focus is on the chat list
+        _t.sleep(0.3)
+        hotkey("ctrl", "f")          # global search in Telegram Desktop
+        _t.sleep(0.6)
+        pyperclip.copy(contact)
+        hotkey("ctrl", "v")
+        _t.sleep(1.5)
+        press_key("down")            # highlight first result
+        _t.sleep(0.3)
+        press_key("enter")           # open that chat
+        _t.sleep(1.0)
+        pyperclip.copy(message)
+        hotkey("ctrl", "v")
+        _t.sleep(0.3)
+        press_key("enter")
+        return f"Sent Telegram message to {contact}"
+    except Exception as exc:
+        return f"Telegram message error: {exc}"
+
+
+def send_whatsapp_message(contact: str, message: str) -> str:
+    """
+    Open WhatsApp Desktop and send a message to a contact.
+    contact: the person's name as it appears in WhatsApp (e.g. 'Mom', 'Alice Smith')
+             OR a phone number with country code (e.g. '+12025551234').
+             Phone numbers use the direct URL scheme; names use WhatsApp's search.
+    message: the text to send.
+    """
+    try:
+        import time as _t
+        import pyperclip
+        from automation.mouse_keyboard import press_key, hotkey
+
+        digits_only = contact.strip().lstrip("+").replace(" ", "").replace("-", "")
+
+        # Fast path: looks like a phone number (all digits after stripping + and spaces)
+        if digits_only.isdigit() and len(digits_only) >= 7:
+            import urllib.parse
+            url = f"whatsapp://send?phone={digits_only}&text={urllib.parse.quote(message)}"
+            subprocess.Popen(f'start "" "{url}"', shell=True)
+            _t.sleep(4)
+            press_key("enter")
+            return f"Sent WhatsApp message to +{digits_only}"
+
+        # Name-based path: open app, search by contact name, open chat, send
+        subprocess.Popen('start "" "whatsapp://"', shell=True)
+        _t.sleep(4)
+        hotkey("ctrl", "f")          # focuses the contact/chat search box
+        _t.sleep(0.6)
+        pyperclip.copy(contact.strip())
+        hotkey("ctrl", "v")
+        _t.sleep(1.5)
+        press_key("down")            # highlight first result
+        _t.sleep(0.3)
+        press_key("enter")           # open that chat
+        _t.sleep(1.0)
+        pyperclip.copy(message)
+        hotkey("ctrl", "v")
+        _t.sleep(0.3)
+        press_key("enter")
+        return f"Sent WhatsApp message to {contact}"
+    except Exception as exc:
+        return f"WhatsApp message error: {exc}"
+
+
+def send_discord_message(contact: str, message: str) -> str:
+    """
+    Open Discord and send a DM to a user by their display name or username.
+    contact: the Discord display name or username to search for (e.g. 'Alex', 'alex#1234').
+    message: the text to send.
+    """
+    try:
+        import time as _t
+        import pyperclip
+        from automation.mouse_keyboard import press_key, hotkey
+
+        subprocess.Popen('start "" "discord://"', shell=True)
+        _t.sleep(4)
+        hotkey("ctrl", "k")          # Discord quick-switcher searches friends & servers
+        _t.sleep(0.8)
+        pyperclip.copy(contact.strip())
+        hotkey("ctrl", "v")
+        _t.sleep(1.2)
+        press_key("down")            # highlight first match
+        _t.sleep(0.3)
+        press_key("enter")           # open DM
+        _t.sleep(1.0)
+        pyperclip.copy(message)
+        hotkey("ctrl", "v")
+        _t.sleep(0.3)
+        press_key("enter")
+        return f"Sent Discord DM to {contact}"
+    except Exception as exc:
+        return f"Discord message error: {exc}"
+
+
 # ── Reminders ─────────────────────────────────────────────────────────────────
 
 def add_reminder(text: str, due_time: str = "") -> str:
@@ -944,7 +1058,7 @@ def list_directory(path: str = "") -> str:
     """
     try:
         if not path:
-            path = os.path.join(os.path.expanduser("~"), "Desktop")
+            path = r"C:\Users\yosef\OneDrive\Desktop"
         path = os.path.expandvars(os.path.expanduser(path))
         if not os.path.isdir(path):
             return f"Directory not found: {path}"
@@ -1884,6 +1998,9 @@ TOOL_MAP: dict = {fn.__name__: fn for fn in [
     open_url,
     get_directions,
     search_maps,
+    send_telegram_message,
+    send_whatsapp_message,
+    send_discord_message,
     add_reminder,
     list_reminders,
     dismiss_reminder,

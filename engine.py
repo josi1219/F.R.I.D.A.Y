@@ -253,9 +253,10 @@ class FridayEngine:
             return
 
         wake_available = (
-            self._listener._wake_model is not None        # model already loaded
-            or bool(getattr(config, "WAKE_WORD_MODEL", ""))  # model configured (may still be loading)
-            or (bool(getattr(config, "WAKE_KEYWORD", "")) and self._listener.ready)
+            self._listener._wake_model is not None           # OWW model already loaded
+            or bool(getattr(config, "WAKE_WORD_MODEL", ""))  # OWW model configured (may be downloading)
+            or bool(getattr(config, "WAKE_KEYWORD", ""))     # explicit STT keyword set
+            or self._listener.ready                           # STT ready → 'friday' keyword fallback
         )
 
         if wake_available:

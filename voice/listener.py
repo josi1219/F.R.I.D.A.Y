@@ -274,8 +274,17 @@ class VoiceListener:
             self._stop_event.clear()
             return self._wait_for_keyword(timeout)
 
-        # Fallback: OpenWakeWord model
+        # ── Path 2: OpenWakeWord neural detector ─────────────────────────
         if self._wake_model is None:
+            # Model not yet loaded (still downloading or unavailable).
+            # Fall back to STT keyword detection so Friday is always reachable
+            # by voice — even during the initial model download window.
+            if stt_ok:
+                logger.info(
+                    "OpenWakeWord model not ready — using STT keyword fallback ('friday')"
+                )
+                self._stop_event.clear()
+                return self._wait_for_keyword(timeout, _keyword="friday")
             return False
 
         self._stop_event.clear()
@@ -324,20 +333,22 @@ class VoiceListener:
                     # Use max score across all models — robust against key name variations
                     # (e.g. "hey_jarvis" vs "hey_jarvis_v0.1")
                     score = max(preds.values()) if preds else 0.0
-                    if score > 0.6:
+                    if score > 0.5:
                         logger.info("Wake word detected (score=%.2f)", score)
                         return True
                 except Exception:
                     pass
         return False
 
-    def _wait_for_keyword(self, timeout: float = 0.0) -> bool:
+    def _wait_for_keyword(self, timeout: float = 0.0, _keyword: str = "") -> bool:
         """
         Ultra-sensitive STT-based keyword spotter.
         Continuously records audio bursts above WAKE_VAD_THRESHOLD and checks
-        whether Groq Whisper's transcription contains WAKE_KEYWORD.
+        whether the transcription contains the wake keyword.
+        _keyword overrides WAKE_KEYWORD for the fallback path.
         Any phrase with the keyword wakes FRIDAY regardless of surrounding words.
         """
+        keyword = (_keyword or WAKE_KEYWORD).lower()
         min_chunks    = int(0.40 * SAMPLE_RATE / CHUNK_FRAMES)   # skip clips < 0.4s  (noise/echo)
         max_chunks    = int(2.5  * SAMPLE_RATE / CHUNK_FRAMES)   # cap at 2.5s for fast turnaround
         silence_limit = int(0.4  * SAMPLE_RATE / CHUNK_FRAMES)   # 0.4s silence = end of clip
@@ -421,8 +432,8 @@ class VoiceListener:
                 except Exception:
                     continue
 
-                if WAKE_KEYWORD in text:
-                    logger.info("Wake keyword %r detected in: %r", WAKE_KEYWORD, text)
+                if keyword in text:
+                    logger.info("Wake keyword %r detected in: %r", keyword, text)
                     return True
 
                 # Not a match — drain stale queue backlog and keep listening
@@ -447,7 +458,8 @@ class VoiceListener:
         def _loop():
             self._stop_event.clear()
             while not self._stop_event.is_set():
-                if use_wake_word and self._wake_model is not None:
+                wake_ok = self._wake_model is not None or bool(WAKE_KEYWORD)
+                if use_wake_word and wake_ok:
                     detected = self.wait_for_wake_word()
                     if not detected:
                         continue
