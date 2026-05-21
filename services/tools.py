@@ -1745,7 +1745,10 @@ def research_topic(goal: str, save_report: bool = False) -> str:
         snippets: dict[str, str] = {}
 
         try:
-            from duckduckgo_search import DDGS
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                from duckduckgo_search import DDGS
             with DDGS() as ddgs:
                 ddg_results = list(ddgs.text(goal, max_results=6))
             for r in ddg_results:
