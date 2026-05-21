@@ -62,9 +62,10 @@ class ProactiveMonitor:
         self._stop_event  = threading.Event()
 
         # Cooldown trackers
-        self._last_cpu_alert    = 0.0
+        self._last_cpu_alert     = 0.0
+        self._last_ram_alert     = 0.0
         self._last_battery_alert = 0.0
-        self._last_break_alert  = 0.0
+        self._last_break_alert   = 0.0
 
         # Work session tracking
         self._session_start = time.time()
@@ -124,7 +125,7 @@ class ProactiveMonitor:
                 self._last_cpu_alert = now
 
         # ── RAM spike ─────────────────────────────────────────────────────
-        if HAS_PSUTIL and (now - self._last_cpu_alert) > self.CPU_SPIKE_COOLDOWN:
+        if HAS_PSUTIL and (now - self._last_ram_alert) > self.CPU_SPIKE_COOLDOWN:
             ram = psutil.virtual_memory().percent
             if ram >= self.RAM_SPIKE_THRESHOLD:
                 top_proc = _top_process_by("memory_percent")
@@ -134,6 +135,7 @@ class ProactiveMonitor:
                     f"{culprit}"
                 )
                 self._alert(msg, toast_msg=f"RAM at {ram:.0f}%")
+                self._last_ram_alert = now
 
         # ── Battery low ───────────────────────────────────────────────────
         if HAS_PSUTIL and (now - self._last_battery_alert) > self.BATTERY_COOLDOWN:

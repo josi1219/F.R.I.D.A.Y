@@ -79,8 +79,8 @@ if HAS_QT:
         state_changed = pyqtSignal(str)
         text_update   = pyqtSignal(str)
 
-        _W = 280
-        _H = 80
+        _W = 420
+        _H = 130
 
         def __init__(self):
             super().__init__()
@@ -88,10 +88,18 @@ if HAS_QT:
             self._transcript = "F.R.I.D.A.Y. ready"
             self._anim_phase = 0.0
             self._drag_pos   = QPoint()
+            # Live stats
+            self._cpu        = 0.0
+            self._ram        = 0.0
+            self._reminders  = 0
+            self._weather    = ""
+            import datetime as _dt
+            self._clock      = _dt.datetime.now().strftime("%I:%M %p")
 
             self._setup_window()
             self._position_window()
             self._start_animation()
+            self._start_stats_timers()
 
             # Connect own signals
             self.state_changed.connect(self._on_state_changed)
@@ -134,6 +142,19 @@ if HAS_QT:
             self._anim_timer.timeout.connect(self._advance_animation)
             self._anim_timer.start()
 
+        def _start_stats_timers(self):
+            """Start live clock (1 s) and system-stats (2 s) polling timers."""
+            self._clock_timer = QTimer()
+            self._clock_timer.setInterval(1000)
+            self._clock_timer.timeout.connect(self._update_clock)
+            self._clock_timer.start()
+
+            self._stats_timer = QTimer()
+            self._stats_timer.setInterval(2000)
+            self._stats_timer.timeout.connect(self._poll_system_stats)
+            self._stats_timer.start()
+            self._poll_system_stats()   # seed immediately
+
         def _advance_animation(self):
             speed = {
                 STATE_IDLE:      0.015,
@@ -168,7 +189,7 @@ if HAS_QT:
             p.drawRoundedRect(1, 1, self._W - 2, self._H - 2, 15, 15)
 
             # State indicator circle (left side)
-            cx, cy, cr = 28, self._H // 2, 10
+            cx, cy, cr = 28, 40, 10
             import math
             pulse = 0.5 + 0.5 * math.sin(self._anim_phase * 2 * math.pi)
             if self._state == STATE_THINKING:
@@ -231,6 +252,89 @@ if HAS_QT:
             p.setPen(QColor(80, 100, 160, 140))
             p.drawText(self._W - 72, 14, "F.R.I.D.A.Y.")
 
+            # ── Stats row ─────────────────────────────────────────────────
+            import math as _math
+
+            # Divider
+            div_y = 78
+            p.setPen(QPen(QColor(50, 80, 120, 80), 1))
+            p.drawLine(12, div_y, self._W - 12, div_y)
+
+            stats_base_y = 101   # centre of stats row
+
+            # Inner helper: draw labelled progress bar
+            def _draw_bar(label: str, pct: float, bx: int, bw: int,
+                          hi_rgb: tuple, ok_rgb: tuple) -> None:
+                bar_h = 5
+                bar_y = stats_base_y - bar_h // 2
+                if pct >= 80:
+                    fg = QColor(*hi_rgb)
+                elif pct >= 50:
+                    fg = QColor(240, 180, 40)
+                else:
+                    fg = QColor(*ok_rgb)
+                # track
+                p.setBrush(QBrush(QColor(40, 50, 70, 100)))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawRoundedRect(bx, bar_y, bw, bar_h, 2, 2)
+                # fill
+                fill_w = max(2, int(bw * pct / 100))
+                p.setBrush(QBrush(fg))
+                p.drawRoundedRect(bx, bar_y, fill_w, bar_h, 2, 2)
+                # text label below bar
+                lf = QFont("Segoe UI", 6)
+                p.setFont(lf)
+                lc = QColor(fg)
+                lc.setAlpha(200)
+                p.setPen(lc)
+                p.drawText(bx, stats_base_y + 14, label)
+
+            cpu_pct = min(100, max(0, self._cpu))
+            _draw_bar(f"CPU {cpu_pct:.0f}%", cpu_pct, 12, 90,
+                      (255, 80, 60), (60, 210, 120))
+
+            ram_pct = min(100, max(0, self._ram))
+            _draw_bar(f"RAM {ram_pct:.0f}%", ram_pct, 116, 90,
+                      (255, 80, 60), (80, 160, 240))
+
+            # Weather snippet (if set)
+            if self._weather:
+                wf = QFont("Segoe UI", 6)
+                p.setFont(wf)
+                p.setPen(QColor(130, 170, 200, 170))
+                wfm = QFontMetrics(wf)
+                wclip = wfm.elidedText(
+                    self._weather, Qt.TextElideMode.ElideRight, 96
+                )
+                p.drawText(220, stats_base_y + 14, wclip)
+
+            # Clock — right aligned
+            cf = QFont("Segoe UI", 9)
+            cf.setBold(True)
+            p.setFont(cf)
+            p.setPen(QColor(160, 195, 235, 210))
+            cfm   = QFontMetrics(cf)
+            cw    = cfm.horizontalAdvance(self._clock)
+            p.drawText(self._W - cw - 12, stats_base_y + 5, self._clock)
+
+            # Reminder badge
+            if self._reminders > 0:
+                br = 8
+                bx = self._W - 16
+                by = div_y - 10
+                p.setBrush(QBrush(QColor(255, 130, 0, 230)))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawEllipse(QPoint(bx, by), br, br)
+                nf = QFont("Segoe UI", 6)
+                nf.setBold(True)
+                p.setFont(nf)
+                p.setPen(QColor(10, 10, 10))
+                p.drawText(
+                    QRect(bx - br, by - br, br * 2, br * 2),
+                    Qt.AlignmentFlag.AlignCenter,
+                    str(min(99, self._reminders)),
+                )
+
             p.end()
 
         # ── Signals / Slots ────────────────────────────────────────────────
@@ -250,6 +354,33 @@ if HAS_QT:
         def set_text(self, text: str):
             """Thread-safe transcript update via signal."""
             self.text_update.emit(text)
+
+        def set_stats(self, cpu: float = -1.0, ram: float = -1.0,
+                      reminder_count: int = -1, weather: str = "") -> None:
+            """Thread-safe stats update — callable from any thread."""
+            if cpu >= 0:
+                self._cpu = cpu
+            if ram >= 0:
+                self._ram = ram
+            if reminder_count >= 0:
+                self._reminders = reminder_count
+            if weather:
+                self._weather = weather
+            self.update()
+
+        def _update_clock(self) -> None:
+            import datetime as _dt
+            self._clock = _dt.datetime.now().strftime("%I:%M %p")
+            self.update()
+
+        def _poll_system_stats(self) -> None:
+            try:
+                import psutil
+                self._cpu = psutil.cpu_percent(interval=None)
+                self._ram = psutil.virtual_memory().percent
+            except Exception:
+                pass
+            self.update()
 
         # ── Drag ──────────────────────────────────────────────────────────
 
@@ -390,6 +521,7 @@ else:
         def show(self): pass
         def set_state(self, s): pass
         def set_text(self, t): pass
+        def set_stats(self, *a, **k): pass
 
     class AnnotationOverlay:
         def __init__(self): pass

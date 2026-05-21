@@ -1564,7 +1564,7 @@ def analyze_document(path: str, question: str = "Summarize this document.") -> s
                 )
 
         # ── Word (.docx) ──────────────────────────────────────────────
-        elif suffix in (".docx", ".doc"):
+        elif suffix == ".docx":
             try:
                 import docx
                 doc = docx.Document(path)
@@ -1574,6 +1574,14 @@ def analyze_document(path: str, question: str = "Summarize this document.") -> s
                     "python-docx not installed — run: pip install python-docx\n"
                     "Then retry."
                 )
+
+        # ── Legacy Word (.doc) — binary format, not supported by python-docx ──
+        elif suffix == ".doc":
+            return (
+                f"Legacy .doc format is not supported directly, Sir. "
+                f"Please open '{os.path.basename(path)}' in Word and save it as .docx, "
+                f"then ask me to analyze it again."
+            )
 
         # ── Plain text / code ─────────────────────────────────────────
         elif suffix in (".txt", ".md", ".py", ".js", ".ts", ".json", ".csv",
@@ -1651,7 +1659,13 @@ def fetch_webpage_text(url: str, question: str = "") -> str:
                 "Chrome/120.0.0.0 Safari/537.36"
             )
         }
-        resp = req_lib.get(url, headers=headers, timeout=12)
+        try:
+            resp = req_lib.get(url, headers=headers, timeout=12)
+        except Exception:
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.simplefilter("ignore")
+                resp = req_lib.get(url, headers=headers, timeout=12, verify=False)
         resp.raise_for_status()
 
         # Strip HTML tags
@@ -1726,35 +1740,68 @@ def research_topic(goal: str, save_report: bool = False) -> str:
     results_text: list[str] = []
 
     try:
-        # Step 1: Get Google search result URLs via DuckDuckGo HTML
-        search_url = f"https://html.duckduckgo.com/html/?q={_qp(goal)}"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
-        resp = req_lib.get(search_url, headers=headers, timeout=10)
-        urls: list[str] = re.findall(
-            r'href="(https?://[^"&]+)"', resp.text
-        )
-        # Filter out tracking/ad URLs
-        clean_urls = [
-            u for u in urls
-            if not any(x in u for x in ("duckduckgo", "google.com/search", "bing.com", "ad."))
-        ][:5]  # top 5 sources
+        # Step 1: Get result URLs and snippets via duckduckgo_search package
+        clean_urls: list[str] = []
+        snippets: dict[str, str] = {}
+
+        try:
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                ddg_results = list(ddgs.text(goal, max_results=6))
+            for r in ddg_results:
+                url = r.get("href", "")
+                if url:
+                    clean_urls.append(url)
+                    # Keep snippet as fallback if page fetch fails later
+                    snippets[url] = f"{r.get('title', '')}: {r.get('body', '')}"
+        except Exception:
+            # Fallback: SearXNG public JSON API (no key required)
+            _sx_headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+                )
+            }
+            for _sx_base in [
+                "https://searx.be",
+                "https://search.sapti.me",
+                "https://searx.tiekoetter.com",
+            ]:
+                try:
+                    _sx_resp = req_lib.get(
+                        f"{_sx_base}/search",
+                        params={"q": goal, "format": "json", "language": "en"},
+                        headers=_sx_headers,
+                        timeout=10,
+                    )
+                    if _sx_resp.status_code == 200:
+                        _sx_data = _sx_resp.json()
+                        for _r in _sx_data.get("results", [])[:6]:
+                            _u = _r.get("url", "")
+                            if _u:
+                                clean_urls.append(_u)
+                                snippets[_u] = (
+                                    f"{_r.get('title', '')}: {_r.get('content', '')}"
+                                )
+                        if clean_urls:
+                            break
+                except Exception:
+                    continue
 
         if not clean_urls:
             return f"Could not find relevant sources for: {goal}"
 
-        # Step 2: Fetch each page
+        # Step 2: Fetch each page; fall back to DDG/SearXNG snippet if page is unreachable
         for url in clean_urls:
             try:
                 content = fetch_webpage_text(url)
-                if content and len(content) > 200:
-                    results_text.append(f"Source: {url}\n{content[:3000]}")
+                if content and len(content) > 200 and not content.startswith("Web fetch error"):
+                    results_text.append(f"Source: {url}\n{content[:3500]}")
+                elif snippets.get(url):
+                    results_text.append(f"Source: {url}\n{snippets[url]}")
             except Exception:
-                continue
+                if snippets.get(url):
+                    results_text.append(f"Source: {url}\n{snippets[url]}")
 
         if not results_text:
             return "Could not retrieve content from any sources."

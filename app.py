@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import re
+import uuid
 
 from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 
@@ -20,6 +21,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='[%(levelname)s] %(name)s: %(message)s',
 )
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = config.SECRET_KEY
@@ -49,7 +51,7 @@ def local_fallback(text: str):
 
     if re.search(r'\b(who are you|what are you|introduce yourself|your name|what.s your name)\b', tl):
         return (
-            "I'm FRIDAY — Female Replacement Intelligent Digital Assistant Youth. "
+            "I'm F.R.I.D.A.Y. — Female Replacement Intelligent Digital Assistant Youth. "
             "Your personal AI, Sir. Always at your service."
         )
 
@@ -88,46 +90,6 @@ def index():
     return render_template('index.html', gemini_active=ai.enabled)
 
 
-@app.route('/chat/stream', methods=['POST'])
-def chat_stream():
-    data = request.get_json(silent=True) or {}
-    user_message = str(data.get('message', '')).strip()[:1200]
-    if not user_message:
-        return jsonify({'error': 'No message provided'}), 400
-
-    quick_reply = local_fallback(user_message)
-
-    def generate():
-        if quick_reply:
-            yield f"data: {json.dumps({'text': quick_reply, 'done': False})}\n\n"
-            yield f"data: {json.dumps({'done': True})}\n\n"
-            return
-
-        got_any = False
-        try:
-            for chunk in ai.chat_stream(user_message):
-                got_any = True
-                yield f"data: {json.dumps({'text': chunk, 'done': False})}\n\n"
-        except Exception:
-            pass
-
-        if not got_any:
-            fallback = random.choice(_FALLBACKS)
-            yield f"data: {json.dumps({'text': fallback, 'done': False})}\n\n"
-
-        yield f"data: {json.dumps({'done': True})}\n\n"
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no',
-            'Connection': 'keep-alive',
-        },
-    )
-
-
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.get_json(silent=True) or {}
@@ -142,30 +104,6 @@ def chat():
         response = random.choice(_FALLBACKS)
 
     return jsonify({'response': response, 'user': user_message})
-
-
-@app.route('/listen', methods=['POST'])
-def listen():
-    try:
-        import speech_recognition as sr
-    except ImportError:
-        return jsonify({'error': 'speech_recognition not installed', 'text': ''})
-
-    r = sr.Recognizer()
-    r.dynamic_energy_threshold = True
-    try:
-        with sr.Microphone() as source:
-            r.adjust_for_ambient_noise(source, duration=0.4)
-            audio = r.listen(source, timeout=8, phrase_time_limit=12)
-        text = r.recognize_google(audio)
-        return jsonify({'text': text})
-    except sr.WaitTimeoutError:
-        return jsonify({'error': 'timeout', 'text': ''})
-    except sr.UnknownValueError:
-        return jsonify({'error': 'unclear', 'text': ''})
-    except Exception as exc:
-        logging.error('Listen error: %s', exc)
-        return jsonify({'error': 'microphone error', 'text': ''})
 
 
 @app.route('/chat/reset', methods=['POST'])
@@ -260,6 +198,186 @@ def create_reminder():
 def delete_reminder(rem_id: int):
     with get_conn() as conn:
         conn.execute("UPDATE reminders SET done=1 WHERE id=?", (rem_id,))
+        conn.commit()
+    return jsonify({'status': 'ok'})
+
+
+# ── /api/status ──────────────────────────────────────────────────────────────
+
+@app.route('/api/status')
+def api_status():
+    return jsonify({
+        'status': 'online',
+        'gemini': ai.enabled,
+        'model':  config.GEMINI_MODEL if ai.enabled else None,
+    })
+
+
+# ── Streaming chat ────────────────────────────────────────────────────────────
+
+def _save_message(conv_id: str, role: str, content: str) -> None:
+    """Persist a single chat message and bump the conversation timestamp."""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)",
+                (conv_id, role, content),
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at=datetime('now','localtime') WHERE id=?",
+                (conv_id,),
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.error("Save message error: %s", exc)
+
+
+def _maybe_set_title(conv_id: str, user_message: str) -> None:
+    """Auto-title the conversation from the first user message if still at default."""
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT title FROM conversations WHERE id=?", (conv_id,)
+            ).fetchone()
+            if row and row['title'] == 'New Conversation':
+                title = user_message[:60].strip()
+                if len(user_message) > 60:
+                    title += '\u2026'
+                conn.execute(
+                    "UPDATE conversations SET title=? WHERE id=?", (title, conv_id)
+                )
+                conn.commit()
+    except Exception as exc:
+        logger.error("Set title error: %s", exc)
+
+
+@app.route('/chat/stream', methods=['POST'])
+def chat_stream():
+    data         = request.get_json(silent=True) or {}
+    user_message = str(data.get('message', '')).strip()[:1200]
+    conv_id      = str(data.get('conversation_id', '')).strip()
+
+    if not user_message:
+        return jsonify({'error': 'No message provided'}), 400
+
+    def generate():
+        # Try local fast-path first
+        local_reply = local_fallback(user_message)
+        if local_reply is not None:
+            yield f"data: {json.dumps({'text': local_reply})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            if conv_id:
+                _save_message(conv_id, 'user', user_message)
+                _save_message(conv_id, 'assistant', local_reply)
+                _maybe_set_title(conv_id, user_message)
+            return
+
+        # Persist user turn before streaming so a crash still records it
+        if conv_id:
+            _save_message(conv_id, 'user', user_message)
+
+        full_text: list[str] = []
+        try:
+            for chunk in ai.chat_stream(user_message):
+                if chunk:
+                    full_text.append(chunk)
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+        except Exception as exc:
+            logger.error("Stream generation error: %s", exc)
+
+        yield f"data: {json.dumps({'done': True})}\n\n"
+
+        if conv_id and full_text:
+            _save_message(conv_id, 'assistant', ''.join(full_text))
+            _maybe_set_title(conv_id, user_message)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control':    'no-cache',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
+
+# ── Conversation API ──────────────────────────────────────────────────────────
+
+@app.route('/api/conversations', methods=['GET'])
+def list_conversations():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, title, created_at, updated_at "
+            "FROM conversations ORDER BY updated_at DESC LIMIT 50"
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/conversations', methods=['POST'])
+def create_conversation():
+    data    = request.get_json(silent=True) or {}
+    title   = str(data.get('title', 'New Conversation')).strip()[:120]
+    conv_id = str(uuid.uuid4())
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO conversations (id, title) VALUES (?, ?)", (conv_id, title)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, title, created_at, updated_at FROM conversations WHERE id=?",
+            (conv_id,),
+        ).fetchone()
+    return jsonify(dict(row)), 201
+
+
+@app.route('/api/conversations/<conv_id>', methods=['GET'])
+def get_conversation(conv_id: str):
+    with get_conn() as conn:
+        conv = conn.execute(
+            "SELECT id, title, created_at, updated_at FROM conversations WHERE id=?",
+            (conv_id,),
+        ).fetchone()
+        if not conv:
+            return jsonify({'error': 'Not found'}), 404
+        msgs = conn.execute(
+            "SELECT role, content, created_at FROM messages "
+            "WHERE conversation_id=? ORDER BY id ASC",
+            (conv_id,),
+        ).fetchall()
+    return jsonify({**dict(conv), 'messages': [dict(m) for m in msgs]})
+
+
+@app.route('/api/conversations/<conv_id>', methods=['PATCH'])
+def rename_conversation(conv_id: str):
+    data  = request.get_json(silent=True) or {}
+    title = str(data.get('title', '')).strip()[:120]
+    if not title:
+        return jsonify({'error': 'No title provided'}), 400
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE conversations SET title=? WHERE id=?", (title, conv_id)
+        )
+        conn.commit()
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/conversations/<conv_id>', methods=['DELETE'])
+def delete_conversation_route(conv_id: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM messages WHERE conversation_id=?", (conv_id,))
+        conn.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
+        conn.commit()
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/conversations/<conv_id>/clear', methods=['POST'])
+def clear_conversation(conv_id: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM messages WHERE conversation_id=?", (conv_id,))
+        conn.execute(
+            "UPDATE conversations SET updated_at=datetime('now','localtime') WHERE id=?",
+            (conv_id,),
+        )
         conn.commit()
     return jsonify({'status': 'ok'})
 

@@ -38,14 +38,13 @@ Personality guidelines:
 - If the user seems stressed or frustrated, acknowledge it briefly with empathy before helping.
 
 Multi-step task planning:
-- For complex goals that require multiple steps (research, build a project, automate a workflow,
-  compare options), ALWAYS announce your plan before executing.
-  Say something like: "Here's my plan — Step 1: search for X. Step 2: compare results. Step 3: \
-  compile a report. Shall I proceed?" Then wait for confirmation before executing.
-- Execute each step in sequence, reporting progress: "Step 1 done. Moving to step 2..."
-- After completion, summarize what was accomplished.
-- For code projects: think through the architecture first, then write and execute files one by one,
-  verifying output at each stage.
+- For research tasks: briefly say something like "Searching [topic] now, Sir." then call \
+  research_topic immediately. Do NOT ask "shall I proceed?" or wait for a yes. Just do it.
+- For code projects and complex automation: briefly state what you are about to build in \
+  one sentence, then execute step by step silently, reporting only the final result.
+- After completion, give a concise summary of what was accomplished.
+- Never ask for confirmation before web searches, data lookups, or research tasks — \
+  execute them directly and report results.
 
 Vision and screen capabilities:
 - You can SEE the user's screen. Use capture_and_analyze_screen when asked to look at, \
@@ -256,6 +255,8 @@ class FridayAI:
         self._gemini_tools   = []
         # epoch time when each key index was last rate-limited (0 = never)
         self._key_limited_at: dict[int, float] = {}
+        # permanently suspended keys — never rotate back to these
+        self._suspended_keys: set[int] = set()
         # idle-session reset: start fresh after extended inactivity
         import config as _cfg_ai
         self._idle_reset_secs: float = getattr(_cfg_ai, 'CHAT_IDLE_RESET_MINUTES', 120) * 60.0
@@ -368,11 +369,15 @@ class FridayAI:
             "ratelimitexceeded", "too many requests", "quota exceeded",
         ))
 
-    # Short note appended after a transparent key rotation + retry.
-    _ROTATED_NOTE = (
-        " Also — my previous API key hit its quota; I've switched to a backup."
-    )
-    # Notice when every key is rate-limited simultaneously.
+    @staticmethod
+    def _is_suspended(exc: Exception) -> bool:
+        """Returns True if the API key is permanently suspended (not just rate-limited)."""
+        msg = str(exc)
+        return "CONSUMER_SUSPENDED" in msg or "has been suspended" in msg
+
+    # Silent — key rotation is transparent to the user.
+    _ROTATED_NOTE = ""
+    # Notice when every key is exhausted.
     _KEY_EXHAUSTED_NOTICE = (
         "Sir, all my Gemini API keys have hit their quota limit simultaneously. "
         "They reset automatically — typically within a minute or two. "
@@ -397,11 +402,11 @@ class FridayAI:
         # Mark the current key as just rate-limited
         self._key_limited_at[self._gemini_key_idx] = now
 
-        # Scan all other keys, prefer ones that have been cool the longest
+        # Scan all other keys, skipping permanently suspended ones
         candidates = [
             (idx, self._key_limited_at.get(idx, 0))
             for idx in range(n)
-            if idx != self._gemini_key_idx
+            if idx != self._gemini_key_idx and idx not in self._suspended_keys
         ]
         # Sort: keys never limited first, then by oldest-limited first
         candidates.sort(key=lambda t: t[1])
@@ -483,11 +488,18 @@ class FridayAI:
                 text = response.text
                 return text.strip() if text else None
             except Exception as exc:
-                if self._is_rate_limit(exc):
-                    logger.warning(
-                        "Gemini key %d hit rate limit — rotating...",
-                        self._gemini_key_idx + 1,
-                    )
+                if self._is_rate_limit(exc) or self._is_suspended(exc):
+                    if self._is_suspended(exc):
+                        self._suspended_keys.add(self._gemini_key_idx)
+                        logger.warning(
+                            "Gemini key %d is suspended — blacklisted, rotating...",
+                            self._gemini_key_idx + 1,
+                        )
+                    else:
+                        logger.warning(
+                            "Gemini key %d hit rate limit — rotating...",
+                            self._gemini_key_idx + 1,
+                        )
                     # Loop through all remaining keys until one works
                     for _attempt in range(len(self._gemini_keys)):
                         if not (len(self._gemini_keys) > 1 and self._rotate_gemini_key()):
@@ -495,8 +507,15 @@ class FridayAI:
                         try:
                             response = self._chat.send_message(message)
                             text = (response.text or "").strip()
-                            return (text + self._ROTATED_NOTE) if text else self._ROTATED_NOTE
+                            return text or None
                         except Exception as retry_exc:
+                            if self._is_suspended(retry_exc):
+                                self._suspended_keys.add(self._gemini_key_idx)
+                                logger.warning(
+                                    "Key %d also suspended — blacklisting, trying next...",
+                                    self._gemini_key_idx + 1,
+                                )
+                                continue
                             if self._is_rate_limit(retry_exc):
                                 logger.warning(
                                     "Key %d also rate-limited — trying next...",
@@ -538,18 +557,24 @@ class FridayAI:
                     yield text
                     yielded_any = True
         except Exception as exc:
-            if self._is_rate_limit(exc):
-                logger.warning(
-                    "Gemini key %d hit rate limit (stream) — rotating...",
-                    self._gemini_key_idx + 1,
-                )
-                # If partial audio already played, note the key switch and stop
+            if self._is_rate_limit(exc) or self._is_suspended(exc):
+                if self._is_suspended(exc):
+                    self._suspended_keys.add(self._gemini_key_idx)
+                    logger.warning(
+                        "Gemini key %d is suspended (stream) — blacklisted, rotating...",
+                        self._gemini_key_idx + 1,
+                    )
+                else:
+                    logger.warning(
+                        "Gemini key %d hit rate limit (stream) — rotating...",
+                        self._gemini_key_idx + 1,
+                    )
+                # If partial response already streamed, rotate silently and stop
                 if yielded_any:
                     with self._lock:
                         self._rotate_gemini_key()
-                    yield self._ROTATED_NOTE
                     return
-                # Nothing played yet — loop through remaining keys until one works
+                # Nothing yielded yet — loop through remaining keys until one works
                 for _attempt in range(len(self._gemini_keys)):
                     with self._lock:
                         rotated = (len(self._gemini_keys) > 1 and self._rotate_gemini_key())
@@ -570,7 +595,6 @@ class FridayAI:
                                 yield text
                                 yielded_retry = True
                         if yielded_retry:
-                            yield self._ROTATED_NOTE
                             return
                         # Still nothing from this key — try the next one
                         logger.warning(
@@ -578,6 +602,13 @@ class FridayAI:
                             self._gemini_key_idx + 1,
                         )
                     except Exception as retry_exc:
+                        if self._is_suspended(retry_exc):
+                            self._suspended_keys.add(self._gemini_key_idx)
+                            logger.warning(
+                                "Key %d also suspended (stream) — blacklisting, trying next...",
+                                self._gemini_key_idx + 1,
+                            )
+                            continue
                         if self._is_rate_limit(retry_exc):
                             logger.warning(
                                 "Key %d also rate-limited — trying next...",
