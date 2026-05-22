@@ -10,6 +10,7 @@ import logging
 import threading
 import os
 import sys
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -224,6 +225,133 @@ def _make_groq_tools(functions: list) -> list:
     return tools
 
 
+# ── Smart Tool Detection ──────────────────────────────────────────────────
+
+def _detect_needed_tools(message: str) -> list:
+    """
+    Detect which tools are actually needed for this message.
+    Reduces token usage by only sending relevant tool definitions.
+    Returns list of tool functions needed.
+    """
+    from services.tools import TOOL_MAP
+    
+    msg_lower = message.lower()
+    needed = set()
+    
+    # Time & Date
+    if any(x in msg_lower for x in ["time", "current time", "what time", "now", "when is"]):
+        needed.add("get_current_time")
+        needed.add("get_current_date")
+    
+    if any(x in msg_lower for x in ["date", "today", "day", "calendar"]):
+        needed.add("get_current_date")
+    
+    # System Info
+    if any(x in msg_lower for x in ["battery", "cpu", "memory", "ram", "disk", "storage", "system"]):
+        needed.add("get_battery_status")
+        needed.add("get_cpu_usage")
+        needed.add("get_memory_usage")
+        needed.add("get_disk_usage")
+        needed.add("get_system_info")
+    
+    # Weather
+    if any(x in msg_lower for x in ["weather", "forecast", "rain", "temperature", "cold", "hot"]):
+        needed.add("get_weather")
+    
+    # Web Search
+    if any(x in msg_lower for x in ["search", "find", "look up", "google", "web", "online"]):
+        needed.add("search_web")
+        needed.add("open_url")
+    
+    if any(x in msg_lower for x in ["youtube", "video", "watch"]):
+        needed.add("search_youtube")
+    
+    # Maps & Navigation
+    if any(x in msg_lower for x in ["map", "direction", "route", "navigate", "go to", "drive to", "directions to"]):
+        needed.add("get_directions")
+        needed.add("search_maps")
+    
+    # Tasks & Reminders
+    if any(x in msg_lower for x in ["task", "todo", "add task", "list task", "my tasks"]):
+        needed.add("add_task")
+        needed.add("list_tasks")
+        needed.add("complete_task")
+    
+    if any(x in msg_lower for x in ["remind", "reminder", "alert", "notification"]):
+        needed.add("add_reminder")
+        needed.add("list_reminders")
+        needed.add("dismiss_reminder")
+    
+    # Applications
+    if any(x in msg_lower for x in ["open", "launch", "run", "start app", "application"]):
+        needed.add("open_application")
+    
+    # Messaging
+    if any(x in msg_lower for x in ["message", "send", "telegram", "whatsapp", "discord", "slack"]):
+        needed.add("send_telegram_message")
+        needed.add("send_whatsapp_message")
+        needed.add("send_discord_message")
+    
+    # Stock/Crypto
+    if any(x in msg_lower for x in ["price", "stock", "crypto", "bitcoin", "ethereum", "watchlist"]):
+        needed.add("add_to_watchlist")
+        needed.add("list_watchlist")
+        needed.add("get_price")
+        needed.add("remove_from_watchlist")
+    
+    # Browser
+    if any(x in msg_lower for x in ["browser", "link", "url", "visit", "website"]):
+        needed.add("open_browser_to")
+        needed.add("open_url")
+    
+    # Web Research (expensive - only if explicitly asked)
+    if any(x in msg_lower for x in ["research", "investigate", "study", "analyze topic"]):
+        needed.add("research_topic")
+        needed.add("fetch_webpage_text")
+    
+    # Document Analysis (expensive - only if explicitly asked)
+    if any(x in msg_lower for x in ["analyze document", "read file", "pdf", "word", "document"]):
+        needed.add("analyze_document")
+        needed.add("read_file_contents")
+    
+    # Notes
+    if any(x in msg_lower for x in ["note", "remember", "save", "memo"]):
+        needed.add("take_note")
+        needed.add("list_notes")
+        needed.add("read_note")
+    
+    # Screen/Vision (very expensive - only if explicitly asked)
+    if any(x in msg_lower for x in ["screen", "screenshot", "see", "look at", "read text", "what's on"]):
+        needed.add("capture_and_analyze_screen")
+        needed.add("read_text_on_screen")
+    
+    # Code Execution (only if explicitly asked)
+    if any(x in msg_lower for x in ["code", "python", "execute", "run script", "bash"]):
+        needed.add("execute_python_code")
+        needed.add("execute_shell_script")
+    
+    # File operations
+    if any(x in msg_lower for x in ["file", "folder", "directory", "create", "delete", "move"]):
+        needed.add("create_file")
+        needed.add("delete_file")
+        needed.add("read_file_contents")
+        needed.add("create_folder")
+        needed.add("list_directory")
+    
+    # Shell commands
+    if any(x in msg_lower for x in ["command", "powershell", "terminal", "cmd"]):
+        needed.add("run_shell_command")
+    
+    # Always include these essentials
+    needed.add("get_current_time")
+    needed.add("get_current_date")
+    needed.add("search_web")
+    
+    # Convert to tool objects
+    result = [TOOL_MAP[name] for name in needed if name in TOOL_MAP]
+    return result if result else [TOOL_MAP.get("get_current_time")]  # fallback
+
+
 def _get_memories_prompt() -> str:
     """Load saved memories from DB and format them for system-prompt injection."""
     try:
@@ -371,6 +499,46 @@ class FridayAI:
             history=history or [],
         )
 
+    def _update_tools_for_message(self, message: str) -> None:
+        """Dynamically update tool list based on message content (smart injection)."""
+        try:
+            self._gemini_tools = _detect_needed_tools(message)
+            logger.info(f"Smart tool detection: using {len(self._gemini_tools)} tools for message")
+        except Exception as exc:
+            logger.error(f"Tool detection error, using all tools: {exc}")
+            from services.tools import ALL_TOOLS
+            self._gemini_tools = ALL_TOOLS
+
+    def _checkpoint_state_before_rotation(self) -> None:
+        """
+        Save current chat/task state before API key rotation.
+        Enables seamless continuation with new key.
+        """
+        try:
+            if not self._chat:
+                return
+            
+            # Save chat history to allow reconstruction
+            state = {
+                'chat_history': str(self._chat.history) if hasattr(self._chat, 'history') else None,
+                'rotated_at': datetime.now().isoformat(),
+                'previous_key_idx': self._gemini_key_idx,
+            }
+            
+            # If a task checkpoint exists, save to it
+            if hasattr(self, '_current_task_checkpoint') and self._current_task_checkpoint:
+                self._current_task_checkpoint.save_checkpoint_state(
+                    'key_rotation',
+                    0,
+                    state
+                )
+                logger.info(f"Saved state before key rotation at task checkpoint")
+            else:
+                logger.info(f"State preserved before key rotation (no active task checkpoint)")
+            
+        except Exception as exc:
+            logger.warning(f"Failed to checkpoint state before rotation: {exc}")
+
     @staticmethod
     def _is_rate_limit(exc: Exception) -> bool:
         msg = str(exc).lower()
@@ -399,9 +567,17 @@ class FridayAI:
         Find the next available Gemini key and open a fresh chat session.
         Skips keys that were rate-limited within the last 62 seconds
         (Gemini per-minute quota resets in ~60 s).
+        
+        CHECKPOINT SYSTEM: Before rotating, saves current execution state
+        to ensure long-running tasks can continue uninterrupted.
+        
         Returns True if a usable key was found, False if all are in cooldown.
         """
         import time
+        
+        # CHECKPOINT: Save state before rotation
+        self._checkpoint_state_before_rotation()
+        
         if len(self._gemini_keys) <= 1:
             return False
 
@@ -493,6 +669,10 @@ class FridayAI:
                 )
                 self._reset_gemini_chat()
             self._last_activity = _now
+            
+            # SMART TOOL INJECTION: Update tools based on message content
+            self._update_tools_for_message(message)
+            
             try:
                 response = self._chat.send_message(message)
                 text = response.text
@@ -555,6 +735,10 @@ class FridayAI:
                     )
                     self._reset_gemini_chat()
                 self._last_activity = _now
+                
+                # SMART TOOL INJECTION: Update tools based on message content
+                self._update_tools_for_message(message)
+                
                 stream = self._chat.send_message_stream(message)
             for chunk in stream:
                 if chunk.text:

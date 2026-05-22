@@ -23,7 +23,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+# Configure Flask to use frontend folder structure
+import os
+template_dir = os.path.join(os.path.dirname(__file__), 'frontend', 'templates')
+static_dir = os.path.join(os.path.dirname(__file__), 'frontend', 'static')
+app = Flask(__name__, template_folder=template_dir, static_folder=static_dir, static_url_path='/static')
 app.secret_key = config.SECRET_KEY
 
 # ── Bootstrap ───────────────────────────────────────────────────────────
@@ -106,14 +110,54 @@ def chat():
     return jsonify({'response': response, 'user': user_message})
 
 
+@app.route('/api/chat', methods=['POST'])
+def api_chat():
+    """Non-streaming chat endpoint for the frontend."""
+    data = request.get_json(silent=True) or {}
+    user_message = str(data.get('message', '')).strip()[:1200]
+    if not user_message:
+        return jsonify({'error': 'No message provided'}), 400
+
+    response = local_fallback(user_message)
+    if response is None:
+        response = ai.chat(user_message)
+    if not response:
+        response = random.choice(_FALLBACKS)
+
+    return jsonify({'response': response, 'user': user_message})
+
+
 @app.route('/chat/reset', methods=['POST'])
 def chat_reset():
     ai.reset()
     return jsonify({'status': 'ok'})
 
 
+@app.route('/api/chat/reset', methods=['POST'])
+def api_chat_reset():
+    """Reset chat endpoint for the frontend."""
+    ai.reset()
+    return jsonify({'status': 'ok'})
+
+
 @app.route('/tts', methods=['POST'])
 def tts():
+    data = request.get_json(silent=True) or {}
+    text = str(data.get('text', '')).strip()[:700]
+    tone = str(data.get('tone', 'auto'))
+    if not text:
+        return jsonify({'error': 'No text provided'}), 400
+    try:
+        audio = synthesize(text, tone)
+        return send_file(audio, mimetype='audio/mpeg')
+    except Exception as exc:
+        logging.error('TTS error: %s', exc)
+        return jsonify({'error': 'TTS generation failed'}), 500
+
+
+@app.route('/api/tts', methods=['POST'])
+def api_tts():
+    """TTS endpoint for the frontend."""
     data = request.get_json(silent=True) or {}
     text = str(data.get('text', '')).strip()[:700]
     tone = str(data.get('tone', 'auto'))
@@ -299,6 +343,143 @@ def chat_stream():
             'X-Accel-Buffering': 'no',
         },
     )
+
+
+@app.route('/api/chat/stream', methods=['POST'])
+def api_chat_stream():
+    """Streaming chat endpoint for the frontend."""
+    data         = request.get_json(silent=True) or {}
+    user_message = str(data.get('message', '')).strip()[:1200]
+    conv_id      = str(data.get('conversation_id', '')).strip()
+
+    if not user_message:
+        return jsonify({'error': 'No message provided'}), 400
+
+    def generate():
+        # Try local fast-path first
+        local_reply = local_fallback(user_message)
+        if local_reply is not None:
+            yield f"data: {json.dumps({'text': local_reply})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            if conv_id:
+                _save_message(conv_id, 'user', user_message)
+                _save_message(conv_id, 'assistant', local_reply)
+                _maybe_set_title(conv_id, user_message)
+            return
+
+        # Persist user turn before streaming so a crash still records it
+        if conv_id:
+            _save_message(conv_id, 'user', user_message)
+
+        full_text: list[str] = []
+        try:
+            for chunk in ai.chat_stream(user_message):
+                if chunk:
+                    full_text.append(chunk)
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+        except Exception as exc:
+            logger.error("Stream generation error: %s", exc)
+
+        yield f"data: {json.dumps({'done': True})}\n\n"
+
+        if conv_id and full_text:
+            _save_message(conv_id, 'assistant', ''.join(full_text))
+            _maybe_set_title(conv_id, user_message)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control':    'no-cache',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
+
+# ── Research & Document Analysis API ──────────────────────────────────────────
+
+@app.route('/api/research/analyze', methods=['POST'])
+def start_research_analysis():
+    """
+    Start a long-running document analysis task with checkpoint persistence.
+    
+    Request body:
+    {
+        "task_id": "analysis_20260522_xyz",
+        "file_path": "/path/to/document.pdf",
+        "analysis_prompt": "optional custom analysis instructions"
+    }
+    
+    Returns: Server-Sent Events stream with progress updates and final report
+    """
+    try:
+        data = request.get_json() or {}
+        task_id = data.get('task_id') or f"analysis_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        file_path = data.get('file_path')
+        analysis_prompt = data.get('analysis_prompt')
+        
+        if not file_path:
+            return jsonify({'error': 'file_path required'}), 400
+        
+        from services.research_engine import ResearchEngine
+        engine = ResearchEngine(ai)
+        
+        def generate():
+            """Stream progress updates to client."""
+            try:
+                for message in engine.analyze_document(task_id, file_path, analysis_prompt):
+                    yield f"data: {json.dumps({'message': message})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        
+        return Response(
+            stream_with_context(generate()),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no',
+            }
+        )
+    
+    except Exception as e:
+        logger.error(f"Research analysis error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/research/status/<task_id>', methods=['GET'])
+def get_research_status(task_id):
+    """Get progress of a research task."""
+    try:
+        from services.research_engine import ResearchEngine
+        engine = ResearchEngine(ai)
+        progress = engine.get_task_progress(task_id)
+        return jsonify(progress)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/research/tasks', methods=['GET'])
+def list_research_tasks():
+    """List all research/analysis tasks."""
+    try:
+        from services.research_engine import ResearchEngine
+        engine = ResearchEngine(ai)
+        tasks = engine.list_tasks()
+        return jsonify(tasks)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/research/report/<task_id>', methods=['GET'])
+def get_research_report(task_id):
+    """Get final report for completed task."""
+    try:
+        from storage.task_checkpoint import TaskCheckpoint
+        cp = TaskCheckpoint(task_id, 'document_analysis')
+        report = cp.get_final_report()
+        return jsonify({'task_id': task_id, 'report': report})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # ── Conversation API ──────────────────────────────────────────────────────────

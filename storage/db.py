@@ -93,6 +93,71 @@ def init_db() -> None:
                 content         TEXT NOT NULL,
                 created_at      TEXT DEFAULT (datetime('now','localtime'))
             );
+
+            -- ── Task Checkpoint System (for long-running workflows) ────────────────
+            
+            CREATE TABLE IF NOT EXISTS task_checkpoints (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id         TEXT UNIQUE NOT NULL,
+                status          TEXT DEFAULT 'pending',
+                task_type       TEXT NOT NULL,
+                created_at      TEXT DEFAULT (datetime('now','localtime')),
+                updated_at      TEXT DEFAULT (datetime('now','localtime')),
+                completed_at    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS checkpoint_state (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                checkpoint_id   INTEGER NOT NULL,
+                stage           TEXT NOT NULL,
+                progress        REAL DEFAULT 0.0,
+                state_data      TEXT NOT NULL,
+                created_at      TEXT DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY(checkpoint_id) REFERENCES task_checkpoints(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS processed_chunks (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                checkpoint_id   INTEGER NOT NULL,
+                chunk_id        TEXT NOT NULL,
+                chunk_order     INTEGER,
+                content_hash    TEXT,
+                summary         TEXT,
+                extracted_data  TEXT,
+                status          TEXT DEFAULT 'completed',
+                processed_at    TEXT DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY(checkpoint_id) REFERENCES task_checkpoints(id),
+                UNIQUE(checkpoint_id, chunk_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS report_sections (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                checkpoint_id   INTEGER NOT NULL,
+                section_id      TEXT NOT NULL,
+                section_title   TEXT,
+                markdown_content TEXT,
+                chunk_ids       TEXT,
+                citations       TEXT,
+                created_at      TEXT DEFAULT (datetime('now','localtime')),
+                updated_at      TEXT DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY(checkpoint_id) REFERENCES task_checkpoints(id),
+                UNIQUE(checkpoint_id, section_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS task_metadata (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                checkpoint_id   INTEGER NOT NULL,
+                key             TEXT NOT NULL,
+                value           TEXT,
+                FOREIGN KEY(checkpoint_id) REFERENCES task_checkpoints(id),
+                UNIQUE(checkpoint_id, key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_checkpoint_task_id ON task_checkpoints(task_id);
+            CREATE INDEX IF NOT EXISTS idx_checkpoint_status ON task_checkpoints(status);
+            CREATE INDEX IF NOT EXISTS idx_checkpoint_state_checkpoint ON checkpoint_state(checkpoint_id);
+            CREATE INDEX IF NOT EXISTS idx_processed_chunks_checkpoint ON processed_chunks(checkpoint_id);
+            CREATE INDEX IF NOT EXISTS idx_report_sections_checkpoint ON report_sections(checkpoint_id);
         """)
         conn.commit()
 

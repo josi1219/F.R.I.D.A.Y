@@ -288,7 +288,7 @@ async function sendMessage() {
   let bubbleEl = null;
 
   try {
-    const resp = await fetch('/chat/stream', {
+    const resp = await fetch('/api/chat/stream', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ message: text, conversation_id: currentConvId }),
@@ -458,7 +458,12 @@ function renderMarkdown(el, text) {
   // Single newlines → <br> only outside block elements
   html = html.replace(/([^>])\n([^<])/g, '$1<br>$2');
 
-  el.innerHTML = `<p>${html}</p>`;
+  const newHtml = `<p>${html}</p>`;
+  
+  // Only update if content actually changed (prevents flicker from unnecessary DOM updates)
+  if (el.innerHTML !== newHtml) {
+    el.innerHTML = newHtml;
+  }
 
   // Apply highlight.js to newly inserted code blocks
   el.querySelectorAll('pre code:not(.hljs-applied)').forEach(codeEl => {
@@ -651,7 +656,7 @@ function bindEvents() {
       messagesContainer.innerHTML = '';
       welcomeScreen.style.display = 'flex';
       // Reset AI context on server
-      await fetch('/chat/reset', { method: 'POST' });
+      await fetch('/api/chat/reset', { method: 'POST' });
       showToast('Conversation cleared');
     } catch {
       showToast('Could not clear conversation');

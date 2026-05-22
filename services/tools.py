@@ -1058,7 +1058,7 @@ def list_directory(path: str = "") -> str:
     """
     try:
         if not path:
-            path = r"C:\Users\yosef\OneDrive\Desktop"
+            path = r"D:\gdijf\Desktop"
         path = os.path.expandvars(os.path.expanduser(path))
         if not os.path.isdir(path):
             return f"Directory not found: {path}"
